@@ -1,5 +1,5 @@
 --============================================================================
---  NIGHTFALL · v17 (все объявления наверху — порядок строк не ломает ничего)
+--  NIGHTFALL · v19 (fix: регистры — всё состояние в таблицах ST/UI/T/CFG)
 --  Куда: StarterGui → LocalScript
 --============================================================================
 local Players          = game:GetService("Players")
@@ -13,19 +13,19 @@ local camera      = workspace.CurrentCamera
 
 ---------------------------------------------------------------- ЗВУКИ
 local SOUNDS = {
-    ambient     = { 97293342453669 },
-    crypt       = { 99233367460632 },
-    scream      = { 111964193492156 },
-    roar        = { 99547500520045 },
-    voices      = { 85064677546638 },
-    far         = { 9043345732, 105566512262402 },
-    static      = { 92654778333487 },
-    shot        = { 17705555617 },
-    reload      = { 115065285139253 },
-    crowbarHit  = { 9116542659 },
+    ambient    = { 97293342453669 },
+    crypt      = { 99233367460632 },
+    scream     = { 111964193492156 },
+    roar       = { 99547500520045 },
+    voices     = { 85064677546638 },
+    far        = { 9043345732, 105566512262402 },
+    static     = { 92654778333487 },
+    shot       = { 17705555617 },
+    reload     = { 115065285139253 },
+    crowbarHit = { 9116542659 },
 }
 
----------------------------------------------------------------- палитра
+---------------------------------------------------------------- палитра/шрифты
 local C = {
     bg = Color3.fromHex("#0A0A0C"), panel = Color3.fromHex("#101014"),
     panel2 = Color3.fromHex("#17171C"), hover = Color3.fromHex("#1F1F26"),
@@ -37,6 +37,70 @@ local C = {
 local F = { black = Enum.Font.GothamBlack, bold = Enum.Font.GothamBold, mono = Enum.Font.Code }
 local COMPACT = camera.ViewportSize.X < 900
 
+---------------------------------------------------------------- КОНСТАНТЫ
+local CFG = {
+    rageTimes = { 40, 85, 130, 180 },
+    baseFOV = 70,
+    baseWalkSpeed = 16,
+    MON_BASE_Y = 7.7,
+    HEAVY_INTERVAL = 0.07,
+    MAX_SOUNDS = 14,
+}
+
+---------------------------------------------------------------- СОСТОЯНИЕ (★ все в одной таблице)
+local ST = {
+    running = false,
+    monster = nil, watcher = nil,
+    monsterParts = {}, watcherParts = {},
+    watcherAlive = false,
+    monsterPos = nil,
+    monsterHP = 6, monsterHits = 0, monsterStagger = 0,
+    nextSummon = 0, scareChance = 0.5,
+    nextScare = 0, nextFar = 0, nextBehind = 0, nextFlicker = 0,
+    camShake = 0,
+    monsterRage = 0, rageStart = 0,
+    stalker = nil, stalkerParts = {}, stalkerState = "none",
+    stalkerPos = nil, stalkerTimer = 0, stalkerLookTime = 0, stalkerWalkPhase = 0,
+    crawler = nil, crawlerParts = {}, crawlerState = "none",
+    crawlerPos = nil, crawlerWalkPhase = 0,
+    mother = nil, motherParts = {}, motherPos = nil, motherNext = 0, motherTilt = 0,
+    brute = nil, bruteParts = {}, brutePos = nil,
+    bruteHP = 3, bruteNext = 0, bruteWalkPhase = 0,
+    waveActive = false, waveStartDelay = 0,
+    waveCreatures = {}, waveNextSpawn = 0, waveNearest = nil, waveKills = 0,
+    flashOn = false, monsterAware = false, adrenalineUntil = 0,
+    voicesSnd = nil, staticSnd = nil, ambientSnd = nil,
+    reloadOpen = false, draggingShell = false,
+    radarOpen = false, lastShotgunPing = 0, lastPingBlink = 0,
+    shotgunWorldPos = nil, shotgunModel = nil,
+    lootBoxes = {}, nearestLoot = nil,
+    warnedOnce = false,
+}
+
+local T = {  -- таймеры
+    order = 0,
+    lastStaticTick = 0, lastRadarUpdate = 0, lastHeavyTick = 0,
+    lastShotgunPing = 0, crowbarSwingT = 0,
+}
+
+local INV = { shells = 0, adrenaline = 0, crowbar = false, loaded = { false, false } }
+
+local UI = {}  -- ссылки на интерфейс
+
+-- немного forward-локалов (их мало — регистров хватит)
+local deadBack
+local stopRitualSafe
+local monsterEyes
+local refreshInvUI
+local setStatusSafe
+local flashBehindEvent
+local makeGunTool
+local makeCrowbarTool
+local gunTool
+local crowbarTool
+local crosshair
+local aiming = false
+
 ---------------------------------------------------------------- helpers
 local function New(class, props, kids)
     local inst = Instance.new(class)
@@ -45,20 +109,27 @@ local function New(class, props, kids)
     if kids then for _, kid in ipairs(kids) do kid.Parent = inst end end
     return inst
 end
+
 local function tween(inst, ti, props, style)
     TweenService:Create(inst, TweenInfo.new(ti,
         style or Enum.EasingStyle.Quart, Enum.EasingDirection.Out), props):Play()
 end
-local ORDER = 0
-local function ord() ORDER += 1 return ORDER end
+
+local function ord()
+    T.order += 1
+    return T.order
+end
+
 local function root()
     local c = LocalPlayer.Character
     return c and c:FindFirstChild("HumanoidRootPart")
 end
+
 local function myHum()
     local c = LocalPlayer.Character
     return c and c:FindFirstChildOfClass("Humanoid")
 end
+
 local function part(props)
     local p = New("Part", {
         Anchored = true, CanCollide = false, CanQuery = false, CanTouch = false,
@@ -68,13 +139,13 @@ local function part(props)
     for k, v in pairs(props) do p[k] = v end
     return p
 end
+
 local function groundAt(pos, fallbackY)
     local ray = workspace:Raycast(pos + Vector3.new(0, 100, 0), Vector3.new(0, -400, 0))
     if ray then return ray.Position.Y end
     return fallbackY
 end
 
--- ★ ХИТБОКС: луч → цилиндр
 local function rayHitsCylinder(origin, dir, center, radius, height)
     local mid = center + Vector3.new(0, height / 2, 0)
     local toMid = mid - origin
@@ -95,28 +166,6 @@ for _, d in ipairs(workspace:GetChildren()) do
     if d.Name:sub(1, 3) == "NF_" then d:Destroy() end
 end
 
--- ★ ВСЕ forward-переменные в ОДНОМ месте, в самом начале
-local deadBack
-local stopRitualSafe
-local monsterEyes
-local refreshInvUI
-local setStatusSafe
-local flashBehindEvent
-local makeGunTool
-local makeCrowbarTool
-
-local crosshair
-local aiming = false
-local setAiming
-local gunTool = nil
-local crowbarTool = nil
-local aimingState = function(on)
-    aiming = on
-    if crosshair then crosshair.Visible = on end
-    camera.FieldOfView = on and (70 - 18) or 70
-end
-setAiming = aimingState
-
 ---------------------------------------------------------------- свет
 local SAVED = {
     fogColor = Lighting.FogColor, fogStart = Lighting.FogStart, fogEnd = Lighting.FogEnd,
@@ -132,8 +181,10 @@ local function restoreLight()
     Lighting.Ambient = SAVED.amb
     Lighting.OutdoorAmbient = SAVED.outdoor
 end
+
 local atm = Lighting:FindFirstChildOfClass("Atmosphere")
 local atmSaved = atm and { d = atm.Density, h = atm.Haze, g = atm.Glare, c = atm.Color } or nil
+
 local function setBloodFog(on)
     if on then
         Lighting.ClockTime = 0
@@ -160,9 +211,37 @@ local function setBloodFog(on)
     end
 end
 
----------------------------------------------------------------- звуки
+---------------------------------------------------------------- ЗВУКИ (автоочистка + кап)
 local liveSounds = {}
+local activeSounds = 0
+
+local function cleanupSounds()
+    for i = #liveSounds, 1, -1 do
+        local s = liveSounds[i]
+        if not s or not s.Parent or (not s.Looped and not s.IsPlaying) then
+            if s and s.Parent then s:Destroy() end
+            table.remove(liveSounds, i)
+            activeSounds = math.max(0, activeSounds - 1)
+        end
+    end
+end
+
 local function playId(list, volume, looped, pitch)
+    cleanupSounds()
+    while activeSounds >= CFG.MAX_SOUNDS do
+        local removed = false
+        for i = 1, #liveSounds do
+            local s = liveSounds[i]
+            if s and s.Parent and not s.Looped then
+                s:Destroy()
+                table.remove(liveSounds, i)
+                activeSounds = math.max(0, activeSounds - 1)
+                removed = true
+                break
+            end
+        end
+        if not removed then break end
+    end
     for _, id in ipairs(list) do
         local s = Instance.new("Sound")
         s.SoundId = "rbxassetid://" .. tostring(id)
@@ -176,76 +255,19 @@ local function playId(list, volume, looped, pitch)
         if s.IsLoaded then
             s.Volume = volume or 0.5
             table.insert(liveSounds, s)
+            activeSounds += 1
             return s
         end
         s:Destroy()
     end
     return nil
 end
+
 local function stopAllSounds()
     for _, s in ipairs(liveSounds) do pcall(function() s:Destroy() end) end
     table.clear(liveSounds)
+    activeSounds = 0
 end
-
----------------------------------------------------------------- состояние
-local running = false
-local monster, watcher = nil, nil
-local monsterParts, watcherParts = {}, {}
-local watcherAlive = false
-local monsterPos = nil
-local monsterHP = 6
-local monsterHits = 0
-local monsterStagger = 0
-local nextSummon = 0
-local scareChance = 0.5
-local nextScare, nextFar = 0, 0
-local nextBehind, nextFlicker = 0, 0
-local camShake = 0
-
-local monsterRage = 0
-local rageStart = 0
-local rageTimes = { 40, 85, 130, 180 }
-
-local stalker, stalkerParts = nil, {}
-local stalkerState = "none"
-local stalkerPos = nil
-local stalkerTimer = 0
-local stalkerLookTime = 0
-local stalkerWalkPhase = 0
-
-local crawler, crawlerParts = nil, {}
-local crawlerState = "none"
-local crawlerPos = nil
-local crawlerWalkPhase = 0
-
-local mother, motherParts = nil, {}
-local motherPos = nil
-local motherNext = 0
-local motherTilt = 0
-
-local brute, bruteParts = nil, {}
-local brutePos = nil
-local bruteHP = 3
-local bruteNext = 0
-local bruteWalkPhase = 0
-
-local waveActive = false
-local waveStartDelay = 0
-local waveCreatures = {}
-local waveNextSpawn = 0
-local waveNearest = nil
-local waveKills = 0
-
-local flashOn = false
-local baseFOV = 70
-local baseWalkSpeed = 16
-local monsterAware = false
-local adrenalineUntil = 0
-
-local INV = { shells = 0, adrenaline = 0, crowbar = false, loaded = { false, false } }
-local reloadOpen = false
-
-local voicesSnd, staticSnd, ambientSnd = nil, nil, nil
 
 ---------------------------------------------------------------- фонарик
 local flashPart = part({ Transparency = 1, Size = Vector3.new(0.2, 0.2, 0.2) })
@@ -258,44 +280,47 @@ spot.Enabled = false
 spot.Face = Enum.NormalId.Front
 spot.Parent = flashPart
 flashPart.Parent = workspace
+
 local function setFlash(on)
-    flashOn = on
+    ST.flashOn = on
     spot.Enabled = on
 end
 
 ---------------------------------------------------------------- TRACKER
-local radarGui = New("ScreenGui", {
-    Name = "NF_Radar", ResetOnSpawn = false, IgnoreGuiInset = true,
-    DisplayOrder = 120, Parent = playerGui,
-})
-local radarFrame = New("Frame", {
+UI.radarFrame = New("Frame", {
     BackgroundColor3 = C.bg, BackgroundTransparency = 0.2,
     AnchorPoint = Vector2.new(0, 1), Position = UDim2.new(0, 12, 1, -12),
     Size = COMPACT and UDim2.fromOffset(130, 250) or UDim2.fromOffset(150, 280),
-    Visible = false, Parent = radarGui,
+    Visible = false, Parent = New("ScreenGui", {
+        Name = "NF_Radar", ResetOnSpawn = false, IgnoreGuiInset = true,
+        DisplayOrder = 120, Parent = playerGui,
+    }),
 }, {
     New("UICorner", { CornerRadius = UDim.new(0, 10) }),
     New("UIStroke", { Color = C.blood2, Thickness = 1 }),
 })
+UI.radarGui = UI.radarFrame.Parent
+
 New("TextLabel", {
     Text = "TRACKER", Font = F.black, TextSize = 11, TextColor3 = C.text,
     BackgroundTransparency = 1, Position = UDim2.new(0, 10, 0, 6),
-    Size = UDim2.fromOffset(80, 16), TextXAlignment = Enum.TextXAlignment.Left, Parent = radarFrame,
+    Size = UDim2.fromOffset(80, 16), TextXAlignment = Enum.TextXAlignment.Left, Parent = UI.radarFrame,
 })
-local radarClose = New("TextButton", {
+UI.radarClose = New("TextButton", {
     BackgroundColor3 = C.panel2, AutoButtonColor = false, Text = "",
     Size = UDim2.fromOffset(20, 20), AnchorPoint = Vector2.new(1, 0),
-    Position = UDim2.new(1, -6, 0, 6), Parent = radarFrame,
+    Position = UDim2.new(1, -6, 0, 6), Parent = UI.radarFrame,
 }, { New("UICorner", { CornerRadius = UDim.new(1, 0) }) })
 New("Frame", {
     BackgroundColor3 = C.dim, Size = UDim2.fromOffset(9, 1.5), Rotation = 45,
-    AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Parent = radarClose,
+    AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Parent = UI.radarClose,
 })
 New("Frame", {
     BackgroundColor3 = C.dim, Size = UDim2.fromOffset(9, 1.5), Rotation = -45,
-    AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Parent = radarClose,
+    AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Parent = UI.radarClose,
 })
-local radarRows = {}
+
+UI.radarRows = {}
 local ROW_DEFS = {
     { key = "shotgun", label = "ДРОБОВИК", color = Color3.fromRGB(255, 170, 60) },
     { key = "loot",    label = "ЛУТ",     color = Color3.fromRGB(120, 200, 120) },
@@ -311,7 +336,7 @@ for i, def in ipairs(ROW_DEFS) do
         BackgroundColor3 = C.panel2, BackgroundTransparency = 0.4,
         Size = UDim2.new(1, -12, 0, 22),
         Position = UDim2.new(0, 6, 0, 26 + (i - 1) * 25),
-        Parent = radarFrame,
+        Parent = UI.radarFrame,
     }, { New("UICorner", { CornerRadius = UDim.new(0, 6) }) })
     New("Frame", {
         BackgroundColor3 = def.color, Size = UDim2.fromOffset(7, 7),
@@ -329,21 +354,14 @@ for i, def in ipairs(ROW_DEFS) do
         Position = UDim2.new(1, -7, 0.5, 0), Size = UDim2.fromOffset(46, 14),
         TextXAlignment = Enum.TextXAlignment.Right, Parent = row,
     })
-    radarRows[def.key] = distL
+    UI.radarRows[def.key] = distL
 end
-local radarHint = New("TextLabel", {
+UI.radarHint = New("TextLabel", {
     Text = "", Font = F.mono, TextSize = 9, TextColor3 = C.dim,
     BackgroundTransparency = 1, AnchorPoint = Vector2.new(0, 1),
     Position = UDim2.new(0, 10, 1, -6), Size = UDim2.new(1, -20, 0, 24),
-    TextXAlignment = Enum.TextXAlignment.Left, TextWrapped = true, Parent = radarFrame,
+    TextXAlignment = Enum.TextXAlignment.Left, TextWrapped = true, Parent = UI.radarFrame,
 })
-
-local radarOpen = false
-local lastShotgunPing = 0
-local shotgunWorldPos = nil
-local lastPingBlink = 0
-local lootBoxes = {}
-local nearestLoot = nil
 
 local function distTo(pos)
     local r = root()
@@ -353,81 +371,81 @@ local function distTo(pos)
 end
 
 local function updateRadar(now)
-    if not radarOpen then return end
-    if now - lastShotgunPing >= 5 then
-        lastShotgunPing = now
-        lastPingBlink = now
+    if not ST.radarOpen then return end
+    if now - T.lastShotgunPing >= 5 then
+        T.lastShotgunPing = now
+        ST.lastPingBlink = now
     end
-    local blink = (now - lastPingBlink) < 0.6
+    local blink = (now - ST.lastPingBlink) < 0.6
 
     local haveGun = gunTool ~= nil or INV.loaded[1] or INV.loaded[2] or INV.shells > 0
-    local d = distTo(shotgunWorldPos)
+    local d = distTo(ST.shotgunWorldPos)
     if d and not haveGun then
-        radarRows.shotgun.Text = (blink and "▸ " or "") .. d .. " ст"
-        radarRows.shotgun.Visible = true
+        UI.radarRows.shotgun.Text = (blink and "▸ " or "") .. d .. " ст"
+        UI.radarRows.shotgun.Visible = true
     elseif haveGun then
-        radarRows.shotgun.Text = "у тебя"
-        radarRows.shotgun.Visible = true
+        UI.radarRows.shotgun.Text = "у тебя"
+        UI.radarRows.shotgun.Visible = true
     else
-        radarRows.shotgun.Visible = false
+        UI.radarRows.shotgun.Visible = false
     end
 
-    nearestLoot = nil
+    ST.nearestLoot = nil
     local minLD = math.huge
-    for _, lb in ipairs(lootBoxes) do
+    for _, lb in ipairs(ST.lootBoxes) do
         if lb.model and lb.model.Parent then
             local ld = distTo(lb.pos)
-            if ld and ld < minLD then minLD = ld nearestLoot = ld end
+            if ld and ld < minLD then minLD = ld ST.nearestLoot = ld end
         end
     end
-    if nearestLoot then
-        radarRows.loot.Text = nearestLoot .. " ст"
-        radarRows.loot.Visible = true
+    if ST.nearestLoot then
+        UI.radarRows.loot.Text = ST.nearestLoot .. " ст"
+        UI.radarRows.loot.Visible = true
     else
-        radarRows.loot.Visible = false
+        UI.radarRows.loot.Visible = false
     end
 
-    d = distTo(monsterPos)
-    radarRows.monster.Visible = (d ~= nil and monster ~= nil)
-    if d and monster then radarRows.monster.Text = d .. " ст" end
-    d = distTo(brutePos)
-    radarRows.brute.Visible = (d ~= nil and brute ~= nil)
-    if d and brute then radarRows.brute.Text = d .. " ст(" .. bruteHP .. ")" end
-    d = distTo(stalkerPos)
-    radarRows.stalker.Visible = (d ~= nil and stalkerState ~= "none")
-    if d and stalkerState ~= "none" then radarRows.stalker.Text = d .. " ст" end
-    d = distTo(crawlerPos)
-    radarRows.crawler.Visible = (d ~= nil and crawlerState == "prowl")
-    if d and crawlerState == "prowl" then radarRows.crawler.Text = d .. " ст" end
-    d = distTo(motherPos)
-    radarRows.mother.Visible = (d ~= nil and mother ~= nil)
-    if d and mother then radarRows.mother.Text = d .. " ст" end
-    if waveActive then
-        radarRows.wave.Text = waveNearest and (waveNearest .. " ст") or "..."
-        radarRows.wave.Visible = true
-        radarHint.Text = "ВОЛНА: убей всех!"
-        radarHint.TextColor3 = C.blood
+    d = distTo(ST.monsterPos)
+    UI.radarRows.monster.Visible = (d ~= nil and ST.monster ~= nil)
+    if d and ST.monster then UI.radarRows.monster.Text = d .. " ст" end
+    d = distTo(ST.brutePos)
+    UI.radarRows.brute.Visible = (d ~= nil and ST.brute ~= nil)
+    if d and ST.brute then UI.radarRows.brute.Text = d .. " ст(" .. ST.bruteHP .. ")" end
+    d = distTo(ST.stalkerPos)
+    UI.radarRows.stalker.Visible = (d ~= nil and ST.stalkerState ~= "none")
+    if d and ST.stalkerState ~= "none" then UI.radarRows.stalker.Text = d .. " ст" end
+    d = distTo(ST.crawlerPos)
+    UI.radarRows.crawler.Visible = (d ~= nil and ST.crawlerState == "prowl")
+    if d and ST.crawlerState == "prowl" then UI.radarRows.crawler.Text = d .. " ст" end
+    d = distTo(ST.motherPos)
+    UI.radarRows.mother.Visible = (d ~= nil and ST.mother ~= nil)
+    if d and ST.mother then UI.radarRows.mother.Text = d .. " ст" end
+    if ST.waveActive then
+        UI.radarRows.wave.Text = ST.waveNearest and (ST.waveNearest .. " ст") or "..."
+        UI.radarRows.wave.Visible = true
+        UI.radarHint.Text = "ВОЛНА: убей всех!"
+        UI.radarHint.TextColor3 = C.blood
     else
-        radarRows.wave.Visible = false
-        radarHint.Text = ""
+        UI.radarRows.wave.Visible = false
+        UI.radarHint.Text = ""
     end
 end
 
-radarClose.Activated:Connect(function()
-    radarOpen = false
-    radarFrame.Visible = false
+UI.radarClose.Activated:Connect(function()
+    ST.radarOpen = false
+    UI.radarFrame.Visible = false
 end)
 
 ---------------------------------------------------------------- ИНВЕНТАРЬ
-local invGui = New("ScreenGui", {
+UI.invGui = New("ScreenGui", {
     Name = "NF_Inv", ResetOnSpawn = false, IgnoreGuiInset = true,
     DisplayOrder = 130, Parent = playerGui,
 })
-local invFrame = New("Frame", {
+UI.invFrame = New("Frame", {
     BackgroundColor3 = C.bg, BackgroundTransparency = 0.15,
     AnchorPoint = Vector2.new(1, 1), Position = UDim2.new(1, -12, 1, -12),
     Size = COMPACT and UDim2.fromOffset(150, 180) or UDim2.fromOffset(180, 190),
-    Visible = false, Parent = invGui,
+    Visible = false, Parent = UI.invGui,
 }, {
     New("UICorner", { CornerRadius = UDim.new(0, 10) }),
     New("UIStroke", { Color = C.blood, Thickness = 2, Transparency = 0.2 }),
@@ -435,13 +453,13 @@ local invFrame = New("Frame", {
 New("TextLabel", {
     Text = "ИНВЕНТАРЬ", Font = F.black, TextSize = 11, TextColor3 = C.text,
     BackgroundTransparency = 1, Position = UDim2.new(0, 10, 0, 6),
-    Size = UDim2.fromOffset(100, 16), TextXAlignment = Enum.TextXAlignment.Left, Parent = invFrame,
+    Size = UDim2.fromOffset(100, 16), TextXAlignment = Enum.TextXAlignment.Left, Parent = UI.invFrame,
 })
 local function makeSlot(yPos, label, color)
     local row = New("Frame", {
         BackgroundColor3 = C.panel2, BackgroundTransparency = 0.3,
         Size = UDim2.new(1, -12, 0, 40),
-        Position = UDim2.new(0, 6, 0, yPos), Parent = invFrame,
+        Position = UDim2.new(0, 6, 0, yPos), Parent = UI.invFrame,
     }, { New("UICorner", { CornerRadius = UDim.new(0, 8) }) })
     New("TextLabel", {
         Text = label, Font = F.bold, TextSize = 10, TextColor3 = C.text,
@@ -470,7 +488,7 @@ adrenRow.InputBegan:Connect(function(input)
         or input.UserInputType == Enum.UserInputType.Touch then
         if INV.adrenaline > 0 then
             INV.adrenaline -= 1
-            adrenalineUntil = os.clock() + 30
+            ST.adrenalineUntil = os.clock() + 30
             setStatusSafe("АДРЕНАЛИН · +3 скорости 30с", false)
             refreshInvUI()
         end
@@ -478,7 +496,7 @@ adrenRow.InputBegan:Connect(function(input)
 end)
 
 refreshInvUI = function()
-    invFrame.Visible = running or INV.shells > 0 or INV.adrenaline > 0 or INV.crowbar
+    UI.invFrame.Visible = ST.running or INV.shells > 0 or INV.adrenaline > 0 or INV.crowbar
     shellsCount.Text = "×" .. INV.shells
     adrenCount.Text = "×" .. INV.adrenaline
     adrenSub.Text = INV.adrenaline > 0 and "клик — юзнуть" or ""
@@ -487,16 +505,16 @@ refreshInvUI = function()
 end
 
 ---------------------------------------------------------------- ПЕРЕЗАРЯДКА
-local reloadGui = New("ScreenGui", {
+UI.reloadGui = New("ScreenGui", {
     Name = "NF_Reload", ResetOnSpawn = false, IgnoreGuiInset = true,
     DisplayOrder = 310, Parent = playerGui,
 })
-local reloadFrame = New("CanvasGroup", {
+UI.reloadFrame = New("CanvasGroup", {
     BackgroundColor3 = C.bg, BackgroundTransparency = 0.05,
     AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
     Size = COMPACT and UDim2.fromOffset(340, 230) or UDim2.fromOffset(420, 260),
     Visible = false, GroupTransparency = 1,
-    Parent = reloadGui,
+    Parent = UI.reloadGui,
 }, {
     New("UICorner", { CornerRadius = UDim.new(0, 14) }),
     New("UIStroke", { Color = C.blood, Thickness = 2 }),
@@ -504,49 +522,49 @@ local reloadFrame = New("CanvasGroup", {
 New("TextLabel", {
     Text = "ПЕРЕЗАРЯДКА", Font = F.black, TextSize = 16, TextColor3 = C.text,
     BackgroundTransparency = 1, Position = UDim2.new(0, 16, 0, 10),
-    Size = UDim2.fromOffset(300, 22), TextXAlignment = Enum.TextXAlignment.Left, Parent = reloadFrame,
+    Size = UDim2.fromOffset(300, 22), TextXAlignment = Enum.TextXAlignment.Left, Parent = UI.reloadFrame,
 })
 New("TextLabel", {
     Text = "перетащи патрон в ствол", Font = F.mono, TextSize = 10,
     TextColor3 = C.dim, BackgroundTransparency = 1, Position = UDim2.new(0, 16, 0, 34),
-    Size = UDim2.fromOffset(300, 14), TextXAlignment = Enum.TextXAlignment.Left, Parent = reloadFrame,
+    Size = UDim2.fromOffset(300, 14), TextXAlignment = Enum.TextXAlignment.Left, Parent = UI.reloadFrame,
 })
-local chamber1 = New("Frame", {
+UI.chamber1 = New("Frame", {
     BackgroundColor3 = C.ink, Size = UDim2.fromOffset(64, 84),
-    Position = UDim2.new(0, 40, 0, 66), Parent = reloadFrame,
+    Position = UDim2.new(0, 40, 0, 66), Parent = UI.reloadFrame,
 }, {
     New("UICorner", { CornerRadius = UDim.new(0, 8) }),
     New("UIStroke", { Name = "St", Color = C.blood2, Thickness = 2 }),
 })
-local chamber2 = New("Frame", {
+UI.chamber2 = New("Frame", {
     BackgroundColor3 = C.ink, Size = UDim2.fromOffset(64, 84),
-    Position = UDim2.new(0, 120, 0, 66), Parent = reloadFrame,
+    Position = UDim2.new(0, 120, 0, 66), Parent = UI.reloadFrame,
 }, {
     New("UICorner", { CornerRadius = UDim.new(0, 8) }),
     New("UIStroke", { Name = "St", Color = C.blood2, Thickness = 2 }),
 })
-local ch1Label = New("TextLabel", {
+UI.ch1Label = New("TextLabel", {
     Text = "СТВОЛ 1", Font = F.mono, TextSize = 9, TextColor3 = C.dim,
-    BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 2, Parent = chamber1,
+    BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 2, Parent = UI.chamber1,
 })
-local ch2Label = New("TextLabel", {
+UI.ch2Label = New("TextLabel", {
     Text = "СТВОЛ 2", Font = F.mono, TextSize = 9, TextColor3 = C.dim,
-    BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 2, Parent = chamber2,
+    BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), ZIndex = 2, Parent = UI.chamber2,
 })
-local shellIcon1 = New("Frame", {
+UI.shellIcon1 = New("Frame", {
     BackgroundColor3 = Color3.fromRGB(200, 60, 40), Size = UDim2.fromOffset(22, 56),
     AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
-    Visible = false, ZIndex = 3, Parent = chamber1,
+    Visible = false, ZIndex = 3, Parent = UI.chamber1,
 }, { New("UICorner", { CornerRadius = UDim.new(0, 4) }) })
-local shellIcon2 = New("Frame", {
+UI.shellIcon2 = New("Frame", {
     BackgroundColor3 = Color3.fromRGB(200, 60, 40), Size = UDim2.fromOffset(22, 56),
     AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
-    Visible = false, ZIndex = 3, Parent = chamber2,
+    Visible = false, ZIndex = 3, Parent = UI.chamber2,
 }, { New("UICorner", { CornerRadius = UDim.new(0, 4) }) })
-local shellSource = New("TextButton", {
+UI.shellSource = New("TextButton", {
     BackgroundColor3 = C.panel2, AutoButtonColor = false, Text = "",
     Size = UDim2.fromOffset(74, 84),
-    Position = UDim2.new(0, 210, 0, 66), Parent = reloadFrame,
+    Position = UDim2.new(0, 210, 0, 66), Parent = UI.reloadFrame,
 }, {
     New("UICorner", { CornerRadius = UDim.new(0, 8) }),
     New("UIStroke", { Color = C.line, Thickness = 1 }),
@@ -554,32 +572,32 @@ local shellSource = New("TextButton", {
 New("Frame", {
     BackgroundColor3 = Color3.fromRGB(200, 60, 40), Size = UDim2.fromOffset(20, 50),
     AnchorPoint = Vector2.new(0.5, 0.4), Position = UDim2.fromScale(0.5, 0.4),
-    Parent = shellSource,
+    Parent = UI.shellSource,
 }, { New("UICorner", { CornerRadius = UDim.new(0, 4) }) })
-local shellSrcCount = New("TextLabel", {
+UI.shellSrcCount = New("TextLabel", {
     Text = "×0", Font = F.black, TextSize = 14, TextColor3 = C.text,
     BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 1),
     Position = UDim2.fromScale(0.5, 0.95), Size = UDim2.fromOffset(70, 16),
-    Parent = shellSource,
+    Parent = UI.shellSource,
 })
-local dragShell = New("Frame", {
+UI.dragShell = New("Frame", {
     BackgroundColor3 = Color3.fromRGB(200, 60, 40), Size = UDim2.fromOffset(20, 50),
     AnchorPoint = Vector2.new(0.5, 0.5), Visible = false, ZIndex = 10,
-    Parent = reloadGui,
+    Parent = UI.reloadGui,
 }, { New("UICorner", { CornerRadius = UDim.new(0, 4) }) })
-local closeReload = New("TextButton", {
+UI.closeReload = New("TextButton", {
     BackgroundColor3 = C.panel2, AutoButtonColor = false, Text = "ЗАКРЫТЬ (V)",
     Font = F.bold, TextSize = 11, TextColor3 = C.dim,
     Size = UDim2.fromOffset(140, 30), AnchorPoint = Vector2.new(0.5, 1),
-    Position = UDim2.new(0.5, 0, 1, -10), Parent = reloadFrame,
+    Position = UDim2.new(0.5, 0, 1, -10), Parent = UI.reloadFrame,
 }, { New("UICorner", { CornerRadius = UDim.new(0, 8) }) })
 
 local function refreshReloadUI()
-    ch1Label.TextTransparency = INV.loaded[1] and 1 or 0
-    ch2Label.TextTransparency = INV.loaded[2] and 1 or 0
-    shellIcon1.Visible = INV.loaded[1]
-    shellIcon2.Visible = INV.loaded[2]
-    shellSrcCount.Text = "×" .. INV.shells
+    UI.ch1Label.TextTransparency = INV.loaded[1] and 1 or 0
+    UI.ch2Label.TextTransparency = INV.loaded[2] and 1 or 0
+    UI.shellIcon1.Visible = INV.loaded[1]
+    UI.shellIcon2.Visible = INV.loaded[2]
+    UI.shellSrcCount.Text = "×" .. INV.shells
 end
 
 local function insertShell(chamber)
@@ -602,148 +620,145 @@ local function insertShell(chamber)
             playId(SOUNDS.reload, 0.7, false, 0.8)
         end)
         task.delay(0.7, function()
-            reloadOpen = false
-            tween(reloadFrame, 0.2, { GroupTransparency = 1 })
-            task.delay(0.2, function() reloadFrame.Visible = false end)
+            ST.reloadOpen = false
+            tween(UI.reloadFrame, 0.2, { GroupTransparency = 1 })
+            task.delay(0.2, function() UI.reloadFrame.Visible = false end)
         end)
     end
     return true
 end
 
-local draggingShell = false
-shellSource.InputBegan:Connect(function(input)
-    if INV.shells <= 0 or not reloadOpen then return end
+UI.shellSource.InputBegan:Connect(function(input)
+    if INV.shells <= 0 or not ST.reloadOpen then return end
     if input.UserInputType == Enum.UserInputType.MouseButton1
         or input.UserInputType == Enum.UserInputType.Touch then
-        draggingShell = true
-        dragShell.Visible = true
-        dragShell.Position = UDim2.fromOffset(input.Position.X, input.Position.Y)
+        ST.draggingShell = true
+        UI.dragShell.Visible = true
+        UI.dragShell.Position = UDim2.fromOffset(input.Position.X, input.Position.Y)
     end
 end)
 UserInputService.InputChanged:Connect(function(input)
-    if draggingShell and (input.UserInputType == Enum.UserInputType.MouseMovement
+    if ST.draggingShell and (input.UserInputType == Enum.UserInputType.MouseMovement
         or input.UserInputType == Enum.UserInputType.Touch) then
-        dragShell.Position = UDim2.fromOffset(input.Position.X, input.Position.Y)
-        local inC1 = input.Position.X > chamber1.AbsolutePosition.X
-            and input.Position.X < chamber1.AbsolutePosition.X + chamber1.AbsoluteSize.X
-            and input.Position.Y > chamber1.AbsolutePosition.Y
-            and input.Position.Y < chamber1.AbsolutePosition.Y + chamber1.AbsoluteSize.Y
-        local inC2 = input.Position.X > chamber2.AbsolutePosition.X
-            and input.Position.X < chamber2.AbsolutePosition.X + chamber2.AbsoluteSize.X
-            and input.Position.Y > chamber2.AbsolutePosition.Y
-            and input.Position.Y < chamber2.AbsolutePosition.Y + chamber2.AbsoluteSize.Y
-        chamber1:FindFirstChild("St").Color = inC1 and C.blood or C.blood2
-        chamber2:FindFirstChild("St").Color = inC2 and C.blood or C.blood2
+        UI.dragShell.Position = UDim2.fromOffset(input.Position.X, input.Position.Y)
+        local inC1 = input.Position.X > UI.chamber1.AbsolutePosition.X
+            and input.Position.X < UI.chamber1.AbsolutePosition.X + UI.chamber1.AbsoluteSize.X
+            and input.Position.Y > UI.chamber1.AbsolutePosition.Y
+            and input.Position.Y < UI.chamber1.AbsolutePosition.Y + UI.chamber1.AbsoluteSize.Y
+        local inC2 = input.Position.X > UI.chamber2.AbsolutePosition.X
+            and input.Position.X < UI.chamber2.AbsolutePosition.X + UI.chamber2.AbsoluteSize.X
+            and input.Position.Y > UI.chamber2.AbsolutePosition.Y
+            and input.Position.Y < UI.chamber2.AbsolutePosition.Y + UI.chamber2.AbsoluteSize.Y
+        UI.chamber1:FindFirstChild("St").Color = inC1 and C.blood or C.blood2
+        UI.chamber2:FindFirstChild("St").Color = inC2 and C.blood or C.blood2
     end
 end)
 UserInputService.InputEnded:Connect(function(input)
-    if draggingShell and (input.UserInputType == Enum.UserInputType.MouseButton1
+    if ST.draggingShell and (input.UserInputType == Enum.UserInputType.MouseButton1
         or input.UserInputType == Enum.UserInputType.Touch) then
-        draggingShell = false
-        dragShell.Visible = false
-        chamber1:FindFirstChild("St").Color = C.blood2
-        chamber2:FindFirstChild("St").Color = C.blood2
-        local inC1 = input.Position.X > chamber1.AbsolutePosition.X
-            and input.Position.X < chamber1.AbsolutePosition.X + chamber1.AbsoluteSize.X
-            and input.Position.Y > chamber1.AbsolutePosition.Y
-            and input.Position.Y < chamber1.AbsolutePosition.Y + chamber1.AbsoluteSize.Y
-        local inC2 = input.Position.X > chamber2.AbsolutePosition.X
-            and input.Position.X < chamber2.AbsolutePosition.X + chamber2.AbsoluteSize.X
-            and input.Position.Y > chamber2.AbsolutePosition.Y
-            and input.Position.Y < chamber2.AbsolutePosition.Y + chamber2.AbsoluteSize.Y
+        ST.draggingShell = false
+        UI.dragShell.Visible = false
+        UI.chamber1:FindFirstChild("St").Color = C.blood2
+        UI.chamber2:FindFirstChild("St").Color = C.blood2
+        local inC1 = input.Position.X > UI.chamber1.AbsolutePosition.X
+            and input.Position.X < UI.chamber1.AbsolutePosition.X + UI.chamber1.AbsoluteSize.X
+            and input.Position.Y > UI.chamber1.AbsolutePosition.Y
+            and input.Position.Y < UI.chamber1.AbsolutePosition.Y + UI.chamber1.AbsoluteSize.Y
+        local inC2 = input.Position.X > UI.chamber2.AbsolutePosition.X
+            and input.Position.X < UI.chamber2.AbsolutePosition.X + UI.chamber2.AbsoluteSize.X
+            and input.Position.Y > UI.chamber2.AbsolutePosition.Y
+            and input.Position.Y < UI.chamber2.AbsolutePosition.Y + UI.chamber2.AbsoluteSize.Y
         if inC1 then insertShell(1)
         elseif inC2 then insertShell(2) end
     end
 end)
-closeReload.Activated:Connect(function()
-    reloadOpen = false
-    tween(reloadFrame, 0.2, { GroupTransparency = 1 })
-    task.delay(0.2, function() reloadFrame.Visible = false end)
+UI.closeReload.Activated:Connect(function()
+    ST.reloadOpen = false
+    tween(UI.reloadFrame, 0.2, { GroupTransparency = 1 })
+    task.delay(0.2, function() UI.reloadFrame.Visible = false end)
 end)
 local function toggleReloadUI()
     if not gunTool then
         setStatusSafe("возьми дробовик в руки (хотбар)", true)
         return
     end
-    reloadOpen = not reloadOpen
-    if reloadOpen then
+    ST.reloadOpen = not ST.reloadOpen
+    if ST.reloadOpen then
         refreshReloadUI()
-        reloadFrame.Visible = true
-        reloadFrame.GroupTransparency = 1
-        tween(reloadFrame, 0.2, { GroupTransparency = 0 })
+        UI.reloadFrame.Visible = true
+        UI.reloadFrame.GroupTransparency = 1
+        tween(UI.reloadFrame, 0.2, { GroupTransparency = 0 })
     else
-        tween(reloadFrame, 0.2, { GroupTransparency = 1 })
-        task.delay(0.2, function() reloadFrame.Visible = false end)
+        tween(UI.reloadFrame, 0.2, { GroupTransparency = 1 })
+        task.delay(0.2, function() UI.reloadFrame.Visible = false end)
     end
 end
 
 ---------------------------------------------------------------- УРОН
-local hurtGui = New("ScreenGui", {
+UI.hurtGui = New("ScreenGui", {
     Name = "NF_Hurt", ResetOnSpawn = false, IgnoreGuiInset = true,
     DisplayOrder = 290, Parent = playerGui,
 })
-local hurtFrame = New("Frame", {
+UI.hurtFrame = New("Frame", {
     BackgroundColor3 = Color3.fromRGB(60, 4, 8), BackgroundTransparency = 1,
-    Size = UDim2.fromScale(1, 1), Parent = hurtGui,
+    Size = UDim2.fromScale(1, 1), Parent = UI.hurtGui,
 })
-local hurtLbl = New("TextLabel", {
+UI.hurtLbl = New("TextLabel", {
     Text = "", Font = F.black, TextSize = 60, TextColor3 = C.blood,
     BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5),
     Position = UDim2.new(0.5, 0, 0.45, 0), Size = UDim2.fromOffset(300, 70),
-    TextTransparency = 1, Parent = hurtGui,
+    TextTransparency = 1, Parent = UI.hurtGui,
 })
 local function applyDamage(amount)
     local h = myHum()
     if not h then return end
     h.Health = math.max(0, h.Health - amount)
-    hurtLbl.Text = "-" .. tostring(amount)
-    hurtFrame.BackgroundTransparency = 1
-    tween(hurtFrame, 0.12, { BackgroundTransparency = 0.45 })
-    tween(hurtLbl, 0.12, { TextTransparency = 0 })
-    camShake = math.max(camShake, 0.35)
+    UI.hurtLbl.Text = "-" .. tostring(amount)
+    UI.hurtFrame.BackgroundTransparency = 1
+    tween(UI.hurtFrame, 0.12, { BackgroundTransparency = 0.45 })
+    tween(UI.hurtLbl, 0.12, { TextTransparency = 0 })
+    ST.camShake = math.max(ST.camShake, 0.35)
     task.delay(0.35, function()
-        tween(hurtFrame, 0.9, { BackgroundTransparency = 1 })
-        tween(hurtLbl, 0.6, { TextTransparency = 1 })
+        tween(UI.hurtFrame, 0.9, { BackgroundTransparency = 1 })
+        tween(UI.hurtLbl, 0.6, { TextTransparency = 1 })
     end)
     if h.Health <= 0 then
-        running = false
+        ST.running = false
         task.delay(0.6, function()
             stopRitualSafe(true)
-            deadBack.Visible = true
-            deadBack.BackgroundTransparency = 1
-            tween(deadBack, 0.4, { BackgroundTransparency = 0.08 })
+            UI.deadBack.Visible = true
+            UI.deadBack.BackgroundTransparency = 1
+            tween(UI.deadBack, 0.4, { BackgroundTransparency = 0.08 })
         end)
     end
 end
 
 ---------------------------------------------------------------- помехи
-local fxGui = New("ScreenGui", {
+UI.fxGui = New("ScreenGui", {
     Name = "NF_FX", ResetOnSpawn = false, IgnoreGuiInset = true,
     DisplayOrder = 240, Parent = playerGui,
 })
-local STATIC_ROWS, STATIC_COLS = 12, 9
-local staticHolder = New("Frame", {
-    BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Visible = false, Parent = fxGui,
+UI.staticHolder = New("Frame", {
+    BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Visible = false, Parent = UI.fxGui,
 })
-local staticCells = {}
-for r = 1, STATIC_ROWS do
-    staticCells[r] = {}
-    for c = 1, STATIC_COLS do
-        local cell = New("Frame", {
+UI.staticCells = {}
+for r = 1, 12 do
+    UI.staticCells[r] = {}
+    for c = 1, 9 do
+        UI.staticCells[r][c] = New("Frame", {
             BackgroundColor3 = Color3.new(1, 1, 1), BackgroundTransparency = 1,
-            Size = UDim2.new(1 / STATIC_COLS, 0, 1 / STATIC_ROWS, 0),
-            Position = UDim2.new((c - 1) / STATIC_COLS, 0, (r - 1) / STATIC_ROWS, 0),
-            Parent = staticHolder,
+            Size = UDim2.new(1 / 9, 0, 1 / 12, 0),
+            Position = UDim2.new((c - 1) / 9, 0, (r - 1) / 12, 0),
+            Parent = UI.staticHolder,
         })
-        staticCells[r][c] = cell
     end
 end
 local function setStaticIntensity(intensity)
-    staticHolder.Visible = intensity > 0.02
-    if not staticHolder.Visible then return end
-    for r = 1, STATIC_ROWS do
-        for c = 1, STATIC_COLS do
-            local cell = staticCells[r][c]
+    UI.staticHolder.Visible = intensity > 0.02
+    if not UI.staticHolder.Visible then return end
+    for r = 1, 12 do
+        for c = 1, 9 do
+            local cell = UI.staticCells[r][c]
             if math.random() < intensity * 0.45 then
                 cell.BackgroundTransparency = 1 - math.random() * 0.75
                 cell.BackgroundColor3 = math.random() > 0.5
@@ -756,13 +771,12 @@ local function setStaticIntensity(intensity)
 end
 
 ---------------------------------------------------------------- МОНСТР
-local MON_BASE_Y = 7.7
 local function destroyMonster()
-    if monster then monster:Destroy() monster = nil end
-    table.clear(monsterParts)
+    if ST.monster then ST.monster:Destroy() ST.monster = nil end
+    table.clear(ST.monsterParts)
 end
 local function buildMonster()
-    table.clear(monsterParts)
+    table.clear(ST.monsterParts)
     local m = Instance.new("Model")
     m.Name = "NF_Monster"
     local skin = Color3.fromRGB(12, 10, 13)
@@ -771,7 +785,7 @@ local function buildMonster()
     local function add(props, off)
         local p = part(props)
         p.Parent = m
-        table.insert(monsterParts, { p = p, off = off })
+        table.insert(ST.monsterParts, { p = p, off = off })
         return p
     end
     add({ Size = Vector3.new(2.8, 9, 2), Color = skin, Material = Enum.Material.Slate },
@@ -865,12 +879,12 @@ end
 
 ---------------------------------------------------------------- ГРОМИЛА
 local function destroyBrute()
-    if brute then brute:Destroy() brute = nil end
-    table.clear(bruteParts)
-    brutePos = nil
+    if ST.brute then ST.brute:Destroy() ST.brute = nil end
+    table.clear(ST.bruteParts)
+    ST.brutePos = nil
 end
 local function buildBrute(pos)
-    table.clear(bruteParts)
+    table.clear(ST.bruteParts)
     local b = Instance.new("Model")
     b.Name = "NF_Brute"
     local skin = Color3.fromRGB(72, 58, 48)
@@ -878,7 +892,7 @@ local function buildBrute(pos)
     local function add(props, off)
         local p = part(props)
         p.Parent = b
-        table.insert(bruteParts, { p = p, off = off })
+        table.insert(ST.bruteParts, { p = p, off = off })
         return p
     end
     add({ Size = Vector3.new(4.6, 7.5, 3), Color = skin, Material = Enum.Material.Slate },
@@ -925,19 +939,19 @@ end
 
 ---------------------------------------------------------------- силуэт/стокер
 local function destroyWatcher()
-    if watcher then watcher:Destroy() watcher = nil end
-    table.clear(watcherParts)
-    watcherAlive = false
+    if ST.watcher then ST.watcher:Destroy() ST.watcher = nil end
+    table.clear(ST.watcherParts)
+    ST.watcherAlive = false
 end
 local function buildWatcher(pos)
-    table.clear(watcherParts)
+    table.clear(ST.watcherParts)
     local w = Instance.new("Model")
     w.Name = "NF_Watcher"
     local mat = Color3.fromRGB(8, 8, 10)
     local function add(props, off)
         local p = part(props)
         p.Parent = w
-        table.insert(watcherParts, { p = p, off = off })
+        table.insert(ST.watcherParts, { p = p, off = off })
         return p
     end
     add({ Size = Vector3.new(1.4, 5.2, 0.7), Color = mat,
@@ -949,35 +963,35 @@ local function buildWatcher(pos)
     add({ Size = Vector3.new(0.35, 4.4, 0.35), Color = mat,
         Material = Enum.Material.SmoothPlastic, Transparency = 0.2 }, CFrame.new(0.95, 2.9, 0))
     local base = CFrame.new(pos)
-    for _, e in ipairs(watcherParts) do e.p.CFrame = base * e.off end
+    for _, e in ipairs(ST.watcherParts) do e.p.CFrame = base * e.off end
     w.Parent = workspace
     return w
 end
 
 local function destroyStalker()
-    if stalker then stalker:Destroy() stalker = nil end
-    table.clear(stalkerParts)
-    stalkerState = "none"
+    if ST.stalker then ST.stalker:Destroy() ST.stalker = nil end
+    table.clear(ST.stalkerParts)
+    ST.stalkerState = "none"
 end
 local function buildStalker(pos)
-    table.clear(stalkerParts)
+    table.clear(ST.stalkerParts)
     local s = Instance.new("Model")
     s.Name = "NF_Stalker"
     local skin = Color3.fromRGB(14, 13, 15)
     local function add(props, pivot, halfLen, swingSign)
         local p = part(props)
         p.Parent = s
-        table.insert(stalkerParts, { p = p, pivot = pivot, half = halfLen, sign = swingSign or 0 })
+        table.insert(ST.stalkerParts, { p = p, pivot = pivot, half = halfLen, sign = swingSign or 0 })
         return p
     end
     local torso = part({ Size = Vector3.new(2, 2.2, 1), Color = skin,
         Material = Enum.Material.SmoothPlastic })
     torso.Parent = s
-    table.insert(stalkerParts, { p = torso, pivot = CFrame.new(0, 3.1, 0), half = 0, sign = 0 })
+    table.insert(ST.stalkerParts, { p = torso, pivot = CFrame.new(0, 3.1, 0), half = 0, sign = 0 })
     local head = part({ Size = Vector3.new(1.1, 1.2, 1.1), Color = skin,
         Material = Enum.Material.SmoothPlastic })
     head.Parent = s
-    table.insert(stalkerParts, { p = head, pivot = CFrame.new(0, 4.75, 0), half = 0, sign = 0 })
+    table.insert(ST.stalkerParts, { p = head, pivot = CFrame.new(0, 4.75, 0), half = 0, sign = 0 })
     add({ Size = Vector3.new(0.7, 2.6, 0.7), Color = skin, Material = Enum.Material.SmoothPlastic },
         CFrame.new(-1.35, 4.1, 0), 1.3, 1)
     add({ Size = Vector3.new(0.7, 2.6, 0.7), Color = skin, Material = Enum.Material.SmoothPlastic },
@@ -987,7 +1001,7 @@ local function buildStalker(pos)
     add({ Size = Vector3.new(0.8, 2.8, 0.8), Color = skin, Material = Enum.Material.SmoothPlastic },
         CFrame.new(0.55, 2, 0), 1.4, 1)
     local base = CFrame.new(pos)
-    for _, e in ipairs(stalkerParts) do
+    for _, e in ipairs(ST.stalkerParts) do
         if e.half == 0 then e.p.CFrame = base * e.pivot
         else e.p.CFrame = base * e.pivot * CFrame.new(0, -e.half, 0) end
     end
@@ -997,12 +1011,12 @@ end
 
 ---------------------------------------------------------------- ПОЛЗУН
 local function destroyCrawler()
-    if crawler then crawler:Destroy() crawler = nil end
-    table.clear(crawlerParts)
-    crawlerState = "none"
+    if ST.crawler then ST.crawler:Destroy() ST.crawler = nil end
+    table.clear(ST.crawlerParts)
+    ST.crawlerState = "none"
 end
 local function buildCrawler(pos)
-    table.clear(crawlerParts)
+    table.clear(ST.crawlerParts)
     local c = Instance.new("Model")
     c.Name = "NF_Crawler"
     local pale = Color3.fromRGB(152, 144, 134)
@@ -1011,7 +1025,7 @@ local function buildCrawler(pos)
         local p = part(props)
         p.Name = name
         p.Parent = c
-        table.insert(crawlerParts, { name = name, p = p, off = off })
+        table.insert(ST.crawlerParts, { name = name, p = p, off = off })
         return p
     end
     add("torso", { Size = Vector3.new(1.4, 1.1, 3.2), Color = pale,
@@ -1048,7 +1062,7 @@ local function buildCrawler(pos)
             Color = dark, Material = Enum.Material.SmoothPlastic },
             CFrame.new(side * 0.82, -1.4, 1.45) * CFrame.Angles(math.rad(-20), 0, 0))
     end
-    for _, e in ipairs(crawlerParts) do
+    for _, e in ipairs(ST.crawlerParts) do
         if e.name == "armL" or e.name == "armR" or e.name == "legL" or e.name == "legR" then
             e.p.CFrame = CFrame.new(pos) * e.off * CFrame.new(0, -e.p.Size.Y / 2, 0)
         else
@@ -1061,11 +1075,11 @@ end
 
 ---------------------------------------------------------------- МАТЬ
 local function destroyMother()
-    if mother then mother:Destroy() mother = nil end
-    table.clear(motherParts)
+    if ST.mother then ST.mother:Destroy() ST.mother = nil end
+    table.clear(ST.motherParts)
 end
 local function buildMother(pos)
-    table.clear(motherParts)
+    table.clear(ST.motherParts)
     local m = Instance.new("Model")
     m.Name = "NF_Mother"
     local rag = Color3.fromRGB(34, 30, 36)
@@ -1073,7 +1087,7 @@ local function buildMother(pos)
     local function add(props, off)
         local p = part(props)
         p.Parent = m
-        table.insert(motherParts, { p = p, off = off })
+        table.insert(ST.motherParts, { p = p, off = off })
         return p
     end
     add({ Size = Vector3.new(1.7, 8.5, 1.1), Color = rag, Material = Enum.Material.Slate },
@@ -1107,110 +1121,110 @@ local function buildMother(pos)
 end
 
 ---------------------------------------------------------------- скример
-local scareGui = New("ScreenGui", {
+UI.scareGui = New("ScreenGui", {
     Name = "NF_Scare", ResetOnSpawn = false, IgnoreGuiInset = true,
     DisplayOrder = 300, Parent = playerGui,
 })
-local scareBack = New("Frame", {
-    BackgroundColor3 = C.ink, Size = UDim2.fromScale(1, 1), Visible = false, Parent = scareGui,
+UI.scareBack = New("Frame", {
+    BackgroundColor3 = C.ink, Size = UDim2.fromScale(1, 1), Visible = false, Parent = UI.scareGui,
 })
-local scareTxt = New("TextLabel", {
+UI.scareTxt = New("TextLabel", {
     Text = "ΟΝΟ", Font = F.black, TextSize = 220, TextColor3 = C.blood,
-    BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Visible = false, Parent = scareBack,
+    BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Visible = false, Parent = UI.scareBack,
 })
-local scareTint = New("Frame", {
+UI.scareTint = New("Frame", {
     BackgroundColor3 = C.blood, BackgroundTransparency = 1,
-    Size = UDim2.fromScale(1, 1), ZIndex = 2, Parent = scareBack,
+    Size = UDim2.fromScale(1, 1), ZIndex = 2, Parent = UI.scareBack,
 })
 local function jumpscare(duration, useRealScream)
     duration = duration or 0.35
-    scareBack.Visible = true
-    scareTxt.Visible = true
-    scareTxt.Rotation = math.random(-6, 6)
-    camShake = math.max(camShake, 0.6)
+    UI.scareBack.Visible = true
+    UI.scareTxt.Visible = true
+    UI.scareTxt.Rotation = math.random(-6, 6)
+    ST.camShake = math.max(ST.camShake, 0.6)
     if useRealScream then
         playId(SOUNDS.scream, 1, false)
     else
         playId(SOUNDS.far, 0.9, false, 1.4)
     end
     task.delay(duration, function()
-        scareTxt.Visible = false
-        tween(scareTint, 0.25, { BackgroundTransparency = 0.4 })
+        UI.scareTxt.Visible = false
+        tween(UI.scareTint, 0.25, { BackgroundTransparency = 0.4 })
         task.delay(0.3, function()
-            tween(scareTint, 0.4, { BackgroundTransparency = 1 })
+            tween(UI.scareTint, 0.4, { BackgroundTransparency = 1 })
             task.wait(0.4)
-            scareBack.Visible = false
-            scareTint.BackgroundTransparency = 1
+            UI.scareBack.Visible = false
+            UI.scareTint.BackgroundTransparency = 1
         end)
     end)
 end
 
 ---------------------------------------------------------------- «ОНО ПОЗАДИ»
-local behindGui = New("ScreenGui", {
+UI.behindGui = New("ScreenGui", {
     Name = "NF_Behind", ResetOnSpawn = false, IgnoreGuiInset = true,
     DisplayOrder = 280, Parent = playerGui,
 })
-local behindLbl = New("TextLabel", {
+UI.behindLbl = New("TextLabel", {
     Text = "ОНО ПОЗАДИ ТЕБЯ", Font = F.black, TextSize = 54, TextColor3 = C.blood,
     BackgroundTransparency = 1, Size = UDim2.fromScale(1, 0.12),
-    Position = UDim2.new(0, 0, 0.42, 0), TextTransparency = 1, Parent = behindGui,
+    Position = UDim2.new(0, 0, 0.42, 0), TextTransparency = 1, Parent = UI.behindGui,
 })
 flashBehindEvent = function()
-    behindLbl.TextTransparency = 0
-    behindLbl.Rotation = math.random(-3, 3)
-    camShake = math.max(camShake, 0.3)
+    UI.behindLbl.TextTransparency = 0
+    UI.behindLbl.Rotation = math.random(-3, 3)
+    ST.camShake = math.max(ST.camShake, 0.3)
     task.delay(1.3, function()
-        tween(behindLbl, 0.6, { TextTransparency = 1 })
+        tween(UI.behindLbl, 0.6, { TextTransparency = 1 })
     end)
 end
 
 ---------------------------------------------------------------- отсчёт/смерть/победа
-local cdGui = New("ScreenGui", {
+UI.cdGui = New("ScreenGui", {
     Name = "NF_Countdown", ResetOnSpawn = false, IgnoreGuiInset = true,
     DisplayOrder = 250, Parent = playerGui,
 })
-local cdBack = New("Frame", {
+UI.cdBack = New("Frame", {
     BackgroundColor3 = C.ink, BackgroundTransparency = 1,
-    Size = UDim2.fromScale(1, 1), Visible = false, Parent = cdGui,
+    Size = UDim2.fromScale(1, 1), Visible = false, Parent = UI.cdGui,
 })
-local cdLabel = New("TextLabel", {
+UI.cdLabel = New("TextLabel", {
     Text = "", Font = F.black, TextSize = 160, TextColor3 = C.blood,
-    BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Parent = cdBack,
+    BackgroundTransparency = 1, Size = UDim2.fromScale(1, 1), Parent = UI.cdBack,
 })
 New("TextLabel", {
     Text = "он уже идёт", Font = F.mono, TextSize = 16, TextColor3 = C.dim,
     BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0),
-    Position = UDim2.new(0.5, 0, 0.68, 0), Size = UDim2.fromOffset(400, 24), Parent = cdBack,
+    Position = UDim2.new(0.5, 0, 0.68, 0), Size = UDim2.fromOffset(400, 24), Parent = UI.cdBack,
 })
 local function doCountdown()
-    cdBack.Visible = true
-    cdBack.BackgroundTransparency = 1
-    tween(cdBack, 0.4, { BackgroundTransparency = 0.15 })
+    UI.cdBack.Visible = true
+    UI.cdBack.BackgroundTransparency = 1
+    tween(UI.cdBack, 0.4, { BackgroundTransparency = 0.15 })
     for i = 5, 1, -1 do
-        cdLabel.Text = tostring(i)
-        cdLabel.TextTransparency = 1
-        tween(cdLabel, 0.5, { TextTransparency = 0 }, Enum.EasingStyle.Quad)
+        UI.cdLabel.Text = tostring(i)
+        UI.cdLabel.TextTransparency = 1
+        tween(UI.cdLabel, 0.5, { TextTransparency = 0 }, Enum.EasingStyle.Quad)
         playId(SOUNDS.voices, 0.25, false)
         task.wait(1)
     end
-    cdLabel.Text = "ОН ИДЁТ."
-    tween(cdLabel, 0.3, { TextColor3 = Color3.fromRGB(255, 255, 255) })
+    UI.cdLabel.Text = "ОН ИДЁТ."
+    tween(UI.cdLabel, 0.3, { TextColor3 = Color3.fromRGB(255, 255, 255) })
     playId(SOUNDS.roar, 0.8, false)
     task.wait(0.7)
-    tween(cdBack, 0.5, { BackgroundTransparency = 1 })
+    tween(UI.cdBack, 0.5, { BackgroundTransparency = 1 })
     task.wait(0.5)
-    cdBack.Visible = false
-    cdLabel.TextColor3 = C.blood
+    UI.cdBack.Visible = false
+    UI.cdLabel.TextColor3 = C.blood
 end
 
-local deadGui = New("ScreenGui", {
+UI.deadGui = New("ScreenGui", {
     Name = "NF_Dead", ResetOnSpawn = false, IgnoreGuiInset = true,
     DisplayOrder = 320, Parent = playerGui,
 })
 deadBack = New("TextButton", {
     BackgroundColor3 = Color3.fromRGB(10, 0, 0), BackgroundTransparency = 1,
     Size = UDim2.fromScale(1, 1), Visible = false, AutoButtonColor = false, Text = "",
-    Parent = deadGui,
+    Parent = UI.deadGui,
 })
 New("TextLabel", {
     Text = "ТЫ ПОЙМАН", Font = F.black, TextSize = 72, TextColor3 = C.blood,
@@ -1227,33 +1241,33 @@ deadBack.Activated:Connect(function()
     task.delay(0.4, function() deadBack.Visible = false end)
 end)
 
-local winGui = New("ScreenGui", {
+UI.winGui = New("ScreenGui", {
     Name = "NF_Win", ResetOnSpawn = false, IgnoreGuiInset = true,
     DisplayOrder = 310, Parent = playerGui,
 })
-local winBack = New("Frame", {
+UI.winBack = New("Frame", {
     BackgroundColor3 = C.ink, BackgroundTransparency = 1,
-    Size = UDim2.fromScale(1, 1), Visible = false, Parent = winGui,
+    Size = UDim2.fromScale(1, 1), Visible = false, Parent = UI.winGui,
 })
 New("TextLabel", {
     Text = "ОНО МЕРТВО", Font = F.black, TextSize = 64, TextColor3 = C.blood,
     BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5),
-    Position = UDim2.new(0.5, 0, 0.35, 0), Size = UDim2.fromOffset(800, 80), Parent = winBack,
+    Position = UDim2.new(0.5, 0, 0.35, 0), Size = UDim2.fromOffset(800, 80), Parent = UI.winBack,
 })
-local winSub = New("TextLabel", {
+UI.winSub = New("TextLabel", {
     Text = "", Font = F.mono, TextSize = 16, TextColor3 = C.dim,
     BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5),
-    Position = UDim2.new(0.5, 0, 0.46, 0), Size = UDim2.fromOffset(600, 24), Parent = winBack,
+    Position = UDim2.new(0.5, 0, 0.46, 0), Size = UDim2.fromOffset(600, 24), Parent = UI.winBack,
 })
-local survivedLbl = New("TextLabel", {
+UI.survivedLbl = New("TextLabel", {
     Text = "ТЫ ПЕРЕЖИЛ НОЧЬ", Font = F.black, TextSize = 70, TextColor3 = C.text,
     BackgroundTransparency = 1, AnchorPoint = Vector2.new(0.5, 0.5),
     Position = UDim2.new(0.5, 0, 0.45, 0), Size = UDim2.fromOffset(900, 90),
-    TextTransparency = 1, Parent = winBack,
+    TextTransparency = 1, Parent = UI.winBack,
 })
 
 ---------------------------------------------------------------- МЕНЮ
-local gui = New("ScreenGui", {
+UI.menuGui = New("ScreenGui", {
     Name = "NF_Menu", ResetOnSpawn = false, IgnoreGuiInset = true,
     ZIndexBehavior = Enum.ZIndexBehavior.Sibling, DisplayOrder = 60,
     Parent = playerGui,
@@ -1261,7 +1275,7 @@ local gui = New("ScreenGui", {
 local openBtn = New("TextButton", {
     AutoButtonColor = false, Text = "", BackgroundColor3 = C.panel2,
     Size = UDim2.fromOffset(50, 50), AnchorPoint = Vector2.new(1, 1),
-    Position = UDim2.new(1, -16, 1, -16), Parent = gui,
+    Position = UDim2.new(1, -16, 1, -16), Parent = UI.menuGui,
 }, {
     New("UICorner", { CornerRadius = UDim.new(0, 14) }),
     New("UIStroke", { Color = C.blood, Thickness = 2, Transparency = 0.3 }),
@@ -1271,71 +1285,69 @@ New("Frame", {
     AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Parent = openBtn,
 }, { New("UICorner", { CornerRadius = UDim.new(0, 3) }) })
 
-local panel = New("CanvasGroup", {
+UI.panel = New("CanvasGroup", {
     Visible = false, GroupTransparency = 1,
     BackgroundColor3 = C.bg, AnchorPoint = Vector2.new(0.5, 0.5),
     Position = UDim2.fromScale(0.5, 0.5),
     Size = COMPACT and UDim2.fromScale(0.95, 0.7) or UDim2.fromOffset(420, 360),
-    ClipsDescendants = true, Parent = gui,
+    ClipsDescendants = true, Parent = UI.menuGui,
 }, {
     New("UICorner", { CornerRadius = UDim.new(0, 14) }),
     New("UIStroke", { Color = C.blood2, Thickness = 1 }),
 })
-local panelScale = New("UIScale", { Scale = 0.96, Parent = panel })
+UI.panelScale = New("UIScale", { Scale = 0.96, Parent = UI.panel })
 
-local headerH = 56
-local header = New("Frame", {
-    BackgroundColor3 = C.panel, Size = UDim2.new(1, 0, 0, headerH), Parent = panel,
+UI.header = New("Frame", {
+    BackgroundColor3 = C.panel, Size = UDim2.new(1, 0, 0, 56), Parent = UI.panel,
 })
 New("TextLabel", {
     Text = "NIGHTFALL", Font = F.black, TextSize = 22, TextColor3 = C.text,
     BackgroundTransparency = 1, Position = UDim2.new(0, 18, 0, 8),
-    Size = UDim2.fromOffset(240, 24), TextXAlignment = Enum.TextXAlignment.Left, Parent = header,
+    Size = UDim2.fromOffset(240, 24), TextXAlignment = Enum.TextXAlignment.Left, Parent = UI.header,
 })
 New("TextLabel", {
     Text = "выхода нет", Font = F.mono, TextSize = 10, TextColor3 = C.blood,
     BackgroundTransparency = 1, Position = UDim2.new(0, 18, 0, 34),
-    Size = UDim2.fromOffset(240, 14), TextXAlignment = Enum.TextXAlignment.Left, Parent = header,
+    Size = UDim2.fromOffset(240, 14), TextXAlignment = Enum.TextXAlignment.Left, Parent = UI.header,
 })
-local closeBtn = New("TextButton", {
+UI.closeBtn = New("TextButton", {
     BackgroundColor3 = C.panel2, AutoButtonColor = false, Text = "",
     Size = UDim2.fromOffset(30, 30), AnchorPoint = Vector2.new(1, 0.5),
-    Position = UDim2.new(1, -10, 0.5, 0), Parent = header,
+    Position = UDim2.new(1, -10, 0.5, 0), Parent = UI.header,
 }, { New("UICorner", { CornerRadius = UDim.new(1, 0) }) })
 New("Frame", {
     BackgroundColor3 = C.dim, Size = UDim2.fromOffset(11, 2), Rotation = 45,
-    AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Parent = closeBtn,
+    AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Parent = UI.closeBtn,
 })
 New("Frame", {
     BackgroundColor3 = C.dim, Size = UDim2.fromOffset(11, 2), Rotation = -45,
-    AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Parent = closeBtn,
+    AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5), Parent = UI.closeBtn,
 })
 
-local statusLbl = New("TextLabel", {
+UI.statusLbl = New("TextLabel", {
     Text = "СТАТУС: тихо... пока что", Font = F.mono, TextSize = 11, TextColor3 = C.dim,
     BackgroundColor3 = C.panel2, Size = UDim2.new(1, -24, 0, 30),
-    Position = UDim2.new(0, 12, 0, headerH + 10), TextXAlignment = Enum.TextXAlignment.Left,
-    Parent = panel,
+    Position = UDim2.new(0, 12, 0, 66), TextXAlignment = Enum.TextXAlignment.Left,
+    Parent = UI.panel,
 }, { New("UICorner", { CornerRadius = UDim.new(0, 8) }) })
 
-local function setStatus(txt, isBad)
-    statusLbl.Text = "СТАТУС: " .. txt
-    statusLbl.TextColor3 = isBad and C.blood or C.dim
+setStatusSafe = function(txt, isBad)
+    UI.statusLbl.Text = "СТАТУС: " .. txt
+    UI.statusLbl.TextColor3 = isBad and C.blood or C.dim
 end
-setStatusSafe = setStatus
 
-local body = New("Frame", {
-    BackgroundTransparency = 1, Position = UDim2.new(0, 12, 0, headerH + 50),
-    Size = UDim2.new(1, -24, 1, -(headerH + 62)), Parent = panel,
+UI.body = New("Frame", {
+    BackgroundTransparency = 1, Position = UDim2.new(0, 12, 0, 106),
+    Size = UDim2.new(1, -24, 1, -118), Parent = UI.panel,
 })
 New("UIListLayout", {
-    Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder, Parent = body,
+    Padding = UDim.new(0, 8), SortOrder = Enum.SortOrder.LayoutOrder, Parent = UI.body,
 })
 
 local function menuButton(text, sub, danger, onClick)
     local b = New("TextButton", {
         BackgroundColor3 = C.panel2, AutoButtonColor = false, Text = "",
-        Size = UDim2.new(1, 0, 0, 52), LayoutOrder = ord(), Parent = body,
+        Size = UDim2.new(1, 0, 0, 52), LayoutOrder = ord(), Parent = UI.body,
     }, { New("UICorner", { CornerRadius = UDim.new(0, 10) }) })
     New("Frame", {
         BackgroundColor3 = danger and C.blood or C.blood2,
@@ -1356,7 +1368,31 @@ local function menuButton(text, sub, danger, onClick)
     b.Activated:Connect(onClick)
 end
 
----------------------------------------------------------------- TOOLS (объявлены ДО лута)
+---------------------------------------------------------------- прицел
+UI.crosshair = New("Frame", {
+    AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
+    Size = UDim2.fromOffset(28, 28), BackgroundTransparency = 1,
+    Visible = false, Parent = UI.menuGui,
+})
+for _, data in ipairs({
+    { pos = UDim2.new(0.5, 0, 0, 0), size = UDim2.fromOffset(2, 8) },
+    { pos = UDim2.new(0.5, 0, 1, 0), size = UDim2.fromOffset(2, 8) },
+    { pos = UDim2.new(0, 0, 0.5, 0), size = UDim2.fromOffset(8, 2) },
+    { pos = UDim2.new(1, 0, 0.5, 0), size = UDim2.fromOffset(8, 2) },
+}) do
+    New("Frame", {
+        BackgroundColor3 = C.blood, AnchorPoint = Vector2.new(0.5, 0.5),
+        Position = data.pos, Size = data.size, Parent = UI.crosshair,
+    })
+end
+
+local function setAiming(on)
+    aiming = on
+    UI.crosshair.Visible = on
+    camera.FieldOfView = on and (CFG.baseFOV - 18) or CFG.baseFOV
+end
+
+---------------------------------------------------------------- TOOLS
 makeGunTool = function()
     if gunTool then gunTool:Destroy() end
     local char = LocalPlayer.Character
@@ -1435,24 +1471,6 @@ local function removeGunTool()
     setAiming(false)
 end
 
----------------------------------------------------------------- прицел
-crosshair = New("Frame", {
-    AnchorPoint = Vector2.new(0.5, 0.5), Position = UDim2.fromScale(0.5, 0.5),
-    Size = UDim2.fromOffset(28, 28), BackgroundTransparency = 1,
-    Visible = false, Parent = gui,
-})
-for _, data in ipairs({
-    { pos = UDim2.new(0.5, 0, 0, 0), size = UDim2.fromOffset(2, 8) },
-    { pos = UDim2.new(0.5, 0, 1, 0), size = UDim2.fromOffset(2, 8) },
-    { pos = UDim2.new(0, 0, 0.5, 0), size = UDim2.fromOffset(8, 2) },
-    { pos = UDim2.new(1, 0, 0.5, 0), size = UDim2.fromOffset(8, 2) },
-}) do
-    New("Frame", {
-        BackgroundColor3 = C.blood, AnchorPoint = Vector2.new(0.5, 0.5),
-        Position = data.pos, Size = data.size, Parent = crosshair,
-    })
-end
-
 task.spawn(function()
     while true do
         local char = LocalPlayer.Character
@@ -1468,10 +1486,10 @@ end)
 
 ---------------------------------------------------------------- ЛУТ
 local function spawnLootBoxes()
-    for _, lb in ipairs(lootBoxes) do
+    for _, lb in ipairs(ST.lootBoxes) do
         if lb.model then lb.model:Destroy() end
     end
-    table.clear(lootBoxes)
+    table.clear(ST.lootBoxes)
     local r = root()
     if not r then return end
     local contents_list = { "shells", "shells", "shells", "shells", "shells", "shells",
@@ -1515,34 +1533,32 @@ local function spawnLootBoxes()
             if plr ~= LocalPlayer then return end
             if contents == "adrenaline" then
                 INV.adrenaline += 1
-                setStatus("найдено: АДРЕНАЛИН", false)
+                setStatusSafe("найдено: АДРЕНАЛИН", false)
             elseif contents == "shells" then
                 INV.shells += 2
-                setStatus("найдено: 2 ПАТРОНА", false)
+                setStatusSafe("найдено: 2 ПАТРОНА", false)
             elseif contents == "crowbar" then
                 INV.crowbar = true
                 makeCrowbarTool()
-                setStatus("найдено: ЛОМ · хотбар", false)
+                setStatusSafe("найдено: ЛОМ · хотбар", false)
             else
-                setStatus("ящик пуст...", true)
+                setStatusSafe("ящик пуст...", true)
             end
             refreshInvUI()
-            for _, j in ipairs(lootBoxes) do
+            for _, j in ipairs(ST.lootBoxes) do
                 if j.model == m then j.model = nil end
             end
             m:Destroy()
         end)
 
-        table.insert(lootBoxes, { model = m, pos = pos })
+        table.insert(ST.lootBoxes, { model = m, pos = pos })
     end
 end
 
 ---------------------------------------------------------------- ДВУХСТВОЛКА на карте
-local shotgunModel = nil
-local destroyShotgun
-destroyShotgun = function()
-    if shotgunModel then shotgunModel:Destroy() shotgunModel = nil end
-    shotgunWorldPos = nil
+local function destroyShotgun()
+    if ST.shotgunModel then ST.shotgunModel:Destroy() ST.shotgunModel = nil end
+    ST.shotgunWorldPos = nil
 end
 
 local function spawnShotgun()
@@ -1588,8 +1604,8 @@ local function spawnShotgun()
     pl.Parent = beacon
 
     m.Parent = workspace
-    shotgunModel = m
-    shotgunWorldPos = pos
+    ST.shotgunModel = m
+    ST.shotgunWorldPos = pos
 
     local pr = Instance.new("ProximityPrompt")
     pr.ActionText = "ВЗЯТЬ ДВУХСТВОЛКУ"
@@ -1601,22 +1617,22 @@ local function spawnShotgun()
     pr.Triggered:Connect(function(plr)
         if plr ~= LocalPlayer then return end
         if gunTool or INV.loaded[1] or INV.loaded[2] then
-            setStatus("у тебя уже есть дробовик", true)
+            setStatusSafe("у тебя уже есть дробовик", true)
             return
         end
         INV.loaded[1] = true
         INV.loaded[2] = true
-        monsterAware = true
+        ST.monsterAware = true
         destroyShotgun()
         makeGunTool()
         refreshInvUI()
-        setStatus("ДВУХСТВОЛКА У ТЕБЯ · V = перезарядка", true)
+        setStatusSafe("ДВУХСТВОЛКА У ТЕБЯ · V = перезарядка", true)
     end)
 end
 
 ---------------------------------------------------------------- РИТУАЛ
 stopRitualSafe = function(silent)
-    running = false
+    ST.running = false
     destroyMonster()
     destroyBrute()
     destroyWatcher()
@@ -1624,55 +1640,55 @@ stopRitualSafe = function(silent)
     destroyCrawler()
     destroyMother()
     destroyShotgun()
-    for _, lb in ipairs(lootBoxes) do
+    for _, lb in ipairs(ST.lootBoxes) do
         if lb.model then lb.model:Destroy() end
     end
-    table.clear(lootBoxes)
+    table.clear(ST.lootBoxes)
     removeGunTool()
     if crowbarTool then crowbarTool:Destroy() crowbarTool = nil end
     setBloodFog(false)
     stopAllSounds()
-    camera.FieldOfView = baseFOV
-    staticHolder.Visible = false
-    staticSnd = nil
-    voicesSnd = nil
-    ambientSnd = nil
-    radarFrame.Visible = false
-    radarOpen = false
-    invFrame.Visible = false
-    waveActive = false
-    waveStartDelay = 0
-    table.clear(waveCreatures)
+    camera.FieldOfView = CFG.baseFOV
+    UI.staticHolder.Visible = false
+    ST.staticSnd = nil
+    ST.voicesSnd = nil
+    ST.ambientSnd = nil
+    UI.radarFrame.Visible = false
+    ST.radarOpen = false
+    UI.invFrame.Visible = false
+    ST.waveActive = false
+    ST.waveStartDelay = 0
+    table.clear(ST.waveCreatures)
     INV = { shells = 0, adrenaline = 0, crowbar = false, loaded = { false, false } }
     refreshInvUI()
-    setStatus("тихо... пока что", false)
+    setStatusSafe("тихо... пока что", false)
 end
 
 local function startRitual()
-    if running then
-        setStatus("испытание уже идёт", true)
+    if ST.running then
+        setStatusSafe("испытание уже идёт", true)
         return
     end
-    running = true
-    monsterRage = 0
-    rageStart = os.clock()
-    monsterHP = 6
-    monsterHits = 0
-    monsterStagger = 0
-    nextSummon = 0
-    monsterAware = false
-    waveActive = false
-    waveStartDelay = 0
-    waveKills = 0
+    ST.running = true
+    ST.monsterRage = 0
+    ST.rageStart = os.clock()
+    ST.monsterHP = 6
+    ST.monsterHits = 0
+    ST.monsterStagger = 0
+    ST.nextSummon = 0
+    ST.monsterAware = false
+    ST.waveActive = false
+    ST.waveStartDelay = 0
+    ST.waveKills = 0
     INV.shells = 0
     INV.adrenaline = 0
     INV.crowbar = false
     INV.loaded = { false, false }
     if crowbarTool then crowbarTool:Destroy() crowbarTool = nil end
-    setStatus("ИСПЫТАНИЕ НАЧАЛОСЬ · выхода нет", true)
+    setStatusSafe("ИСПЫТАНИЕ НАЧАЛОСЬ · выхода нет", true)
     task.spawn(function()
         doCountdown()
-        if not running then return end
+        if not ST.running then return end
         local r = root()
         if not r then stopRitualSafe(true) return end
 
@@ -1681,118 +1697,116 @@ local function startRitual()
         spawnPos = Vector3.new(spawnPos.X, groundAt(spawnPos, r.Position.Y), spawnPos.Z)
 
         local built, eyes = buildMonster()
-        monster = built
+        ST.monster = built
         monsterEyes = eyes
-        monsterPos = spawnPos
+        ST.monsterPos = spawnPos
 
         setBloodFog(true)
         spawnShotgun()
         spawnLootBoxes()
-        ambientSnd = playId(SOUNDS.ambient, 0.4, true)
-        voicesSnd = playId(SOUNDS.voices, 0, true, 0.85)
-        staticSnd = playId(SOUNDS.static, 0, true)
+        ST.ambientSnd = playId(SOUNDS.ambient, 0.4, true)
+        ST.voicesSnd = playId(SOUNDS.voices, 0, true, 0.85)
+        ST.staticSnd = playId(SOUNDS.static, 0, true)
 
-        setStatus("ПРОЛОГ: они уже рядом · ищи дробовик, лом и патроны", true)
-        nextScare = os.clock() + 8
-        nextFar = os.clock() + math.random(4, 8)
-        nextBehind = os.clock() + math.random(35, 70)
-        nextFlicker = os.clock() + math.random(20, 50)
+        setStatusSafe("ПРОЛОГ: они уже рядом · ищи дробовик, лом и патроны", true)
+        ST.nextScare = os.clock() + 8
+        ST.nextFar = os.clock() + math.random(4, 8)
+        ST.nextBehind = os.clock() + math.random(35, 70)
+        ST.nextFlicker = os.clock() + math.random(20, 50)
 
-        radarOpen = true
-        radarFrame.Visible = true
+        ST.radarOpen = true
+        UI.radarFrame.Visible = true
         refreshInvUI()
 
         task.delay(math.random(8, 15), function()
-            if not running then return end
+            if not ST.running then return end
             local rr = root()
             if not rr then return end
             local a = math.rad(math.random(0, 359))
-            watcher = buildWatcher(rr.Position + Vector3.new(math.cos(a) * 55, 0, math.sin(a) * 55))
-            watcherAlive = true
+            ST.watcher = buildWatcher(rr.Position + Vector3.new(math.cos(a) * 55, 0, math.sin(a) * 55))
+            ST.watcherAlive = true
         end)
 
         task.delay(2, function()
-            if not running then return end
+            if not ST.running then return end
             local rr = root()
             if not rr then return end
             local lv = rr.CFrame.LookVector
             local p = rr.Position + Vector3.new(-lv.X, 0, -lv.Z) * 25
             p = Vector3.new(p.X, groundAt(p, rr.Position.Y), p.Z)
-            stalker = buildStalker(p)
-            stalkerPos = p
-            stalkerState = "follow"
-            stalkerTimer = os.clock() + math.random(14, 20)
-            stalkerLookTime = 0
-            stalkerWalkPhase = 0
-            setStatus("кто-то идёт за тобой...", true)
+            ST.stalker = buildStalker(p)
+            ST.stalkerPos = p
+            ST.stalkerState = "follow"
+            ST.stalkerTimer = os.clock() + math.random(14, 20)
+            ST.stalkerLookTime = 0
+            ST.stalkerWalkPhase = 0
+            setStatusSafe("кто-то идёт за тобой...", true)
         end)
         task.delay(6, function()
-            if not running then return end
+            if not ST.running then return end
             local rr = root()
             if not rr then return end
             local a = math.rad(math.random(0, 359))
             local p = rr.Position + Vector3.new(math.cos(a) * 35, 0, math.sin(a) * 35)
             p = Vector3.new(p.X, groundAt(p, rr.Position.Y), p.Z)
-            crawler = buildCrawler(p)
-            crawlerPos = p
-            crawlerState = "prowl"
-            crawlerWalkPhase = 0
-            setStatus("шорох с фланга...", true)
+            ST.crawler = buildCrawler(p)
+            ST.crawlerPos = p
+            ST.crawlerState = "prowl"
+            ST.crawlerWalkPhase = 0
+            setStatusSafe("шорох с фланга...", true)
         end)
     end)
 end
 
 local function callStalker()
-    if running then
-        setStatus("сначала ритуал", true)
+    if ST.running then
+        setStatusSafe("сначала ритуал", true)
         return
     end
     local r = root()
     if not r then return end
-    running = true
+    ST.running = true
     setBloodFog(true)
-    ambientSnd = playId(SOUNDS.ambient, 0.35, true)
+    ST.ambientSnd = playId(SOUNDS.ambient, 0.35, true)
     playId(SOUNDS.voices, 0.12, true, 0.85)
     local back = r.CFrame.LookVector * -25
     local pos = r.Position + back
     pos = Vector3.new(pos.X, groundAt(pos, r.Position.Y), pos.Z)
-    stalker = buildStalker(pos)
-    stalkerPos = pos
-    stalkerState = "follow"
-    stalkerTimer = os.clock() + math.random(12, 20)
-    stalkerLookTime = 0
-    stalkerWalkPhase = 0
-    setStatus("за тобой кто-то идёт...", true)
-    radarOpen = true
-    radarFrame.Visible = true
+    ST.stalker = buildStalker(pos)
+    ST.stalkerPos = pos
+    ST.stalkerState = "follow"
+    ST.stalkerTimer = os.clock() + math.random(12, 20)
+    ST.stalkerLookTime = 0
+    ST.stalkerWalkPhase = 0
+    setStatusSafe("за тобой кто-то идёт...", true)
+    ST.radarOpen = true
+    UI.radarFrame.Visible = true
 end
 
 ---------------------------------------------------------------- ГЛАВНЫЙ ЦИКЛ
-local warnedOnce = false
 local lastStaticTick = 0
 local lastRadarUpdate = 0
 local lastHeavyTick = 0
-local HEAVY_INTERVAL = 0.07
 
 RunService.Heartbeat:Connect(function(dt)
-    if flashOn then
+    if ST.flashOn then
         flashPart.CFrame = camera.CFrame
     end
-    if camShake > 0 then
-        camShake = math.max(0, camShake - dt * 1.2)
+    if ST.camShake > 0 then
+        ST.camShake = math.max(0, ST.camShake - dt * 1.2)
         camera.CFrame = camera.CFrame * CFrame.new(
-            (math.random() - 0.5) * camShake,
-            (math.random() - 0.5) * camShake, 0)
+            (math.random() - 0.5) * ST.camShake,
+            (math.random() - 0.5) * ST.camShake, 0)
     end
-    if not running then
-        staticHolder.Visible = false
-        if staticSnd then staticSnd.Volume = 0 end
-        if voicesSnd then voicesSnd.Volume = 0 end
+    if not ST.running then
+        UI.staticHolder.Visible = false
+        if ST.staticSnd then ST.staticSnd.Volume = 0 end
+        if ST.voicesSnd then ST.voicesSnd.Volume = 0 end
         return
     end
 
     local now = os.clock()
-    local heavy = (now - lastHeavyTick) >= HEAVY_INTERVAL
+    local heavy = (now - lastHeavyTick) >= CFG.HEAVY_INTERVAL
     if heavy then lastHeavyTick = now end
     if now - lastRadarUpdate >= 0.35 then
         lastRadarUpdate = now
@@ -1810,82 +1824,83 @@ RunService.Heartbeat:Connect(function(dt)
 
         local h = myHum()
         if h then
-            local bonus = (t < adrenalineUntil) and 3 or 0
-            local target = baseWalkSpeed + bonus
+            local bonus = (t < ST.adrenalineUntil) and 3 or 0
+            local target = CFG.baseWalkSpeed + bonus
             if h.WalkSpeed ~= target then h.WalkSpeed = target end
         end
 
-        local elapsed = t - rageStart
+        -- ярость
+        local elapsed = t - ST.rageStart
         local newRage = 0
-        for i, rt in ipairs(rageTimes) do
+        for i, rt in ipairs(CFG.rageTimes) do
             if elapsed >= rt then newRage = i end
         end
-        if newRage > monsterRage then
-            monsterRage = newRage
-            camShake = 0.5
+        if newRage > ST.monsterRage then
+            ST.monsterRage = newRage
+            ST.camShake = 0.5
             jumpscare(0.4, true)
             playId(SOUNDS.crypt, 0.8, false)
-            setStatus("ОНО ЗВЕРЕЕТ · стадия " .. monsterRage .. "/4", true)
+            setStatusSafe("ОНО ЗВЕРЕЕТ · стадия " .. ST.monsterRage .. "/4", true)
         end
-        scareChance = 0.4 + monsterRage * 0.15
+        ST.scareChance = 0.4 + ST.monsterRage * 0.15
 
         -- МОНСТР
-        if monsterPos then
-            local toMe = (myPos - monsterPos) * Vector3.new(1, 0, 1)
+        if ST.monsterPos then
+            local toMe = (myPos - ST.monsterPos) * Vector3.new(1, 0, 1)
             local dist = toMe.Magnitude
-            local rageVis = monsterRage / 4
-            local speed = 4.5 * (1 + monsterRage * 0.5)
-            if monsterRage == 4 then speed = 4.5 * 2.8 end
+            local rageVis = ST.monsterRage / 4
+            local speed = 4.5 * (1 + ST.monsterRage * 0.5)
+            if ST.monsterRage == 4 then speed = 4.5 * 2.8 end
 
             local dotToM = 0
             if dist > 0.5 then
                 dotToM = flatLook:Dot(toMe.Unit)
             end
-            if hasShotgun and dotToM > 0.9 and dist < 50 then
+            if ST.monsterAware and dotToM > 0.9 and dist < 50 then
                 speed = speed * 0.45
             end
-            if hasShotgun then speed = speed * 0.85 end
-            if t < monsterStagger then
+            if ST.monsterAware then speed = speed * 0.85 end
+            if t < ST.monsterStagger then
                 speed = 0
             end
 
             local targetPos = myPos
-            if monsterAware and dist > 12 then
+            if ST.monsterAware and dist > 12 then
                 targetPos = myPos - flatLook * 10
                 if dotToM < -0.3 then targetPos = myPos end
             end
 
-            local toTarget = (targetPos - monsterPos) * Vector3.new(1, 0, 1)
+            local toTarget = (targetPos - ST.monsterPos) * Vector3.new(1, 0, 1)
             local tDist = toTarget.Magnitude
             if tDist > 0.5 and speed > 0 then
-                monsterPos += toTarget.Unit * math.min(speed * dt, tDist)
+                ST.monsterPos += toTarget.Unit * math.min(speed * dt, tDist)
             end
             if dist > 170 then
                 local a = math.rad(math.random(0, 359))
-                monsterPos = myPos + Vector3.new(math.cos(a) * 90, 0, math.sin(a) * 90)
+                ST.monsterPos = myPos + Vector3.new(math.cos(a) * 90, 0, math.sin(a) * 90)
             end
 
             if heavy then
-                local gy = groundAt(monsterPos, myPos.Y)
+                local gy = groundAt(ST.monsterPos, myPos.Y)
                 local base = CFrame.lookAt(
-                    Vector3.new(monsterPos.X, gy + MON_BASE_Y, monsterPos.Z),
-                    Vector3.new(myPos.X, gy + MON_BASE_Y, myPos.Z))
+                    Vector3.new(ST.monsterPos.X, gy + CFG.MON_BASE_Y, ST.monsterPos.Z),
+                    Vector3.new(myPos.X, gy + CFG.MON_BASE_Y, myPos.Z))
                 local swayFreq = 1.7 + rageVis * 2.5
                 local sway = math.sin(t * swayFreq) * (0.04 + rageVis * 0.06)
                 local twitch = 0
-                if math.floor(t * (2 + monsterRage)) % 6 == 0 then
-                    twitch = math.sin(t * (40 + monsterRage * 20)) * (0.035 + rageVis * 0.05)
+                if math.floor(t * (2 + ST.monsterRage)) % 6 == 0 then
+                    twitch = math.sin(t * (40 + ST.monsterRage * 20)) * (0.035 + rageVis * 0.05)
                 end
-                if t < monsterStagger then
+                if t < ST.monsterStagger then
                     twitch = math.sin(t * 30) * 0.08
                     sway = math.sin(t * 12) * 0.1
                 end
                 local anim = CFrame.Angles(sway * 0.5, twitch, sway * 0.3)
-                for _, e in ipairs(monsterParts) do
+                for _, e in ipairs(ST.monsterParts) do
                     e.p.CFrame = base * e.off * anim
                 end
                 if monsterEyes then
-                    local pulse = 0.5 + 0.5 * math.sin(t * (3 + monsterRage * 2))
+                    local pulse = 0.5 + 0.5 * math.sin(t * (3 + ST.monsterRage * 2))
                     for _, eye in ipairs(monsterEyes) do
                         eye.Color = C.blood:Lerp(Color3.fromRGB(255, 60, 60), pulse)
                         eye.Size = Vector3.one * (0.22 + pulse * 0.12 + rageVis * 0.08)
@@ -1894,99 +1909,99 @@ RunService.Heartbeat:Connect(function(dt)
             end
 
             local proximity = math.clamp(1 - dist / 130, 0, 1)
-            if voicesSnd and voicesSnd.Parent then
-                voicesSnd.Volume = math.clamp(1 - dist / 220, 0, 1) * 0.5
+            if ST.voicesSnd and ST.voicesSnd.Parent then
+                ST.voicesSnd.Volume = math.clamp(1 - dist / 220, 0, 1) * 0.5
             end
-            if staticSnd and staticSnd.Parent then
-                staticSnd.Volume = math.clamp(1 - dist / 90, 0, 1) * 0.6
+            if ST.staticSnd and ST.staticSnd.Parent then
+                ST.staticSnd.Volume = math.clamp(1 - dist / 90, 0, 1) * 0.6
             end
             if heavy then
                 local interference = math.clamp(proximity * (0.6 + rageVis * 0.4), 0, 1)
                 setStaticIntensity(interference)
             end
-            camera.FieldOfView = baseFOV + proximity * 5
+            camera.FieldOfView = CFG.baseFOV + proximity * 5
                 * math.abs(math.sin(t * (1.4 + proximity * 1.8) * math.pi))
 
-            if t > nextFar then
-                nextFar = t + math.random(8, 16) / (1 + monsterRage * 0.3)
+            if t > ST.nextFar then
+                ST.nextFar = t + math.random(8, 16) / (1 + ST.monsterRage * 0.3)
                 playId(SOUNDS.far, 0.35 + proximity * 0.55, false, 0.85 + math.random() * 0.3)
             end
-            if t > nextScare then
-                nextScare = t + math.random(20, 45) / (0.4 + scareChance)
-                if math.random() < scareChance then
-                    jumpscare(0.3, monsterRage >= 3)
+            if t > ST.nextScare then
+                ST.nextScare = t + math.random(20, 45) / (0.4 + ST.scareChance)
+                if math.random() < ST.scareChance then
+                    jumpscare(0.3, ST.monsterRage >= 3)
                 end
             end
-            if monsterHits >= 2 and t > nextSummon then
-                nextSummon = t + math.random(18, 25)
+            if ST.monsterHits >= 2 and t > ST.nextSummon then
+                ST.nextSummon = t + math.random(18, 25)
                 local which = math.random(1, 2)
                 local a = math.rad(math.random(0, 359))
                 playId(SOUNDS.crypt, 0.9, false, 0.7)
-                camShake = 0.3
-                if which == 1 and not stalker then
+                ST.camShake = 0.3
+                if which == 1 and not ST.stalker then
                     local p = myPos + Vector3.new(math.cos(a) * 25, 0, math.sin(a) * 25)
                     p = Vector3.new(p.X, groundAt(p, myPos.Y), p.Z)
-                    stalker = buildStalker(p)
-                    stalkerPos = p
-                    stalkerState = "follow"
-                    stalkerTimer = os.clock() + math.random(10, 16)
-                    stalkerLookTime = 0
-                    stalkerWalkPhase = 0
-                    setStatus("ОНО ЗОВЁТ СВОИХ...", true)
-                elseif which == 2 and not crawler then
+                    ST.stalker = buildStalker(p)
+                    ST.stalkerPos = p
+                    ST.stalkerState = "follow"
+                    ST.stalkerTimer = os.clock() + math.random(10, 16)
+                    ST.stalkerLookTime = 0
+                    ST.stalkerWalkPhase = 0
+                    setStatusSafe("ОНО ЗОВЁТ СВОИХ...", true)
+                elseif which == 2 and not ST.crawler then
                     local p = myPos + Vector3.new(math.cos(a) * 40, 0, math.sin(a) * 40)
                     p = Vector3.new(p.X, groundAt(p, myPos.Y), p.Z)
-                    crawler = buildCrawler(p)
-                    crawlerPos = p
-                    crawlerState = "prowl"
-                    crawlerWalkPhase = 0
-                    setStatus("ОНО ЗОВЁТ СВОИХ... шорох", true)
+                    ST.crawler = buildCrawler(p)
+                    ST.crawlerPos = p
+                    ST.crawlerState = "prowl"
+                    ST.crawlerWalkPhase = 0
+                    setStatusSafe("ОНО ЗОВЁТ СВОИХ... шорох", true)
                 end
             end
-            if dist < 6.5 and t > monsterStagger then
+            if dist < 6.5 and t > ST.monsterStagger then
                 jumpscare(1, true)
-                running = false
+                ST.running = false
                 task.delay(1.1, function()
                     stopRitualSafe(true)
                     deadBack.Visible = true
                     deadBack.BackgroundTransparency = 1
                     tween(deadBack, 0.4, { BackgroundTransparency = 0.08 })
-                    setStatus("ты пойман", true)
+                    setStatusSafe("ты пойман", true)
                 end)
                 return
             end
         end
 
         -- ГРОМИЛА
-        if not waveActive and not brute and monsterPos
-            and (t - rageStart > 120 or monsterHits >= 3) then
+        if not ST.waveActive and not ST.brute and ST.monsterPos
+            and (t - ST.rageStart > 120 or ST.monsterHits >= 3) then
             local a = math.rad(math.random(0, 359))
             local p = myPos + Vector3.new(math.cos(a) * 60, 0, math.sin(a) * 60)
             p = Vector3.new(p.X, groundAt(p, myPos.Y), p.Z)
-            brute = buildBrute(p)
-            brutePos = p
-            bruteHP = 3
-            bruteWalkPhase = 0
-            setStatus("ЗЕМЛЯ ДРОЖИТ. ГРОМИЛА ИДЁТ. 3 патрона.", true)
+            ST.brute = buildBrute(p)
+            ST.brutePos = p
+            ST.bruteHP = 3
+            ST.bruteWalkPhase = 0
+            setStatusSafe("ЗЕМЛЯ ДРОЖИТ. ГРОМИЛА ИДЁТ. 3 патрона.", true)
             playId(SOUNDS.roar, 0.9, false, 0.7)
         end
-        if brutePos and brute and not waveActive then
-            local toMe = myPos - brutePos
+        if ST.brutePos and ST.brute and not ST.waveActive then
+            local toMe = myPos - ST.brutePos
             local flat = Vector3.new(toMe.X, 0, toMe.Z)
             local dist = flat.Magnitude
             local moving = dist > 6
             if moving and dist > 1 then
-                brutePos += flat.Unit * math.min(3.5 * dt, dist)
-                bruteWalkPhase += dt * 3.2
+                ST.brutePos += flat.Unit * math.min(3.5 * dt, dist)
+                ST.bruteWalkPhase += dt * 3.2
             end
             if heavy then
-                local gy = groundAt(brutePos, myPos.Y)
+                local gy = groundAt(ST.brutePos, myPos.Y)
                 local base = CFrame.lookAt(
-                    Vector3.new(brutePos.X, gy, brutePos.Z),
+                    Vector3.new(ST.brutePos.X, gy, ST.brutePos.Z),
                     Vector3.new(myPos.X, gy, myPos.Z))
-                local swing = moving and math.sin(bruteWalkPhase) * 0.35 or 0
+                local swing = moving and math.sin(ST.bruteWalkPhase) * 0.35 or 0
                 local idx = 0
-                for _, e in ipairs(bruteParts) do
+                for _, e in ipairs(ST.bruteParts) do
                     idx += 1
                     if idx >= 6 and idx <= 9 then
                         e.p.CFrame = base * e.off
@@ -2000,32 +2015,32 @@ RunService.Heartbeat:Connect(function(dt)
                 end
             end
             if dist < 7 then
-                if t > bruteNext then
-                    bruteNext = t + 2
+                if t > ST.bruteNext then
+                    ST.bruteNext = t + 2
                     applyDamage(30)
-                    camShake = 0.6
+                    ST.camShake = 0.6
                     playId(SOUNDS.roar, 0.8, false, 0.8)
                 end
             end
         end
 
         -- ВОЛНА
-        if waveStartDelay > 0 and t > waveStartDelay then
-            waveStartDelay = 0
-            waveActive = true
-            waveNextSpawn = 0
-            setStatus("ВОЛНА. УБЕЙ ВСЕХ — И ТЫ ПЕРЕЖИВЁШЬ.", true)
+        if ST.waveStartDelay > 0 and t > ST.waveStartDelay then
+            ST.waveStartDelay = 0
+            ST.waveActive = true
+            ST.waveNextSpawn = 0
+            setStatusSafe("ВОЛНА. УБЕЙ ВСЕХ — И ТЫ ПЕРЕЖИВЁШЬ.", true)
             playId(SOUNDS.roar, 1, false)
-            camShake = 0.6
+            ST.camShake = 0.6
             destroyStalker()
             destroyCrawler()
             destroyMother()
             destroyWatcher()
             destroyBrute()
         end
-        if waveActive then
-            if #waveCreatures < 14 and t > waveNextSpawn then
-                waveNextSpawn = t + math.random(2, 4)
+        if ST.waveActive then
+            if #ST.waveCreatures < 14 and t > ST.waveNextSpawn then
+                ST.waveNextSpawn = t + math.random(2, 4)
                 for _ = 1, math.random(2, 3) do
                     local a = math.rad(math.random(0, 359))
                     local pos = myPos + Vector3.new(math.cos(a) * 300, 0, math.sin(a) * 300)
@@ -2059,7 +2074,7 @@ RunService.Heartbeat:Connect(function(dt)
                     w.PrimaryPart = plist[1].p
                     w:PivotTo(CFrame.lookAt(pos, myPos))
                     w.Parent = workspace
-                    table.insert(waveCreatures, {
+                    table.insert(ST.waveCreatures, {
                         model = w, plist = plist, pos = pos,
                         speed = math.random(11, 16),
                     })
@@ -2067,7 +2082,7 @@ RunService.Heartbeat:Connect(function(dt)
             end
             local nearest = nil
             local alive = {}
-            for _, wc in ipairs(waveCreatures) do
+            for _, wc in ipairs(ST.waveCreatures) do
                 if wc.model and wc.model.Parent then
                     local cPos = wc.pos
                     local toMe = myPos - cPos
@@ -2101,80 +2116,79 @@ RunService.Heartbeat:Connect(function(dt)
                     end
                 end
             end
-            waveCreatures = alive
-            waveNearest = nearest
-            -- ПОБЕДА: спавн иссяк и всех перебил
-            if #waveCreatures == 0 and t > waveNextSpawn and waveKills >= 3 then
-                running = false
-                waveActive = false
+            ST.waveCreatures = alive
+            ST.waveNearest = nearest
+            if #ST.waveCreatures == 0 and t > ST.waveNextSpawn and ST.waveKills >= 3 then
+                ST.running = false
+                ST.waveActive = false
                 stopRitualSafe(true)
-                winBack.Visible = true
-                winBack.BackgroundTransparency = 1
-                tween(winBack, 0.6, { BackgroundTransparency = 0.05 })
-                winSub.Text = "рассвет близко..."
-                tween(survivedLbl, 1, { TextTransparency = 0 })
+                UI.winBack.Visible = true
+                UI.winBack.BackgroundTransparency = 1
+                tween(UI.winBack, 0.6, { BackgroundTransparency = 0.05 })
+                UI.winSub.Text = "рассвет близко..."
+                tween(UI.survivedLbl, 1, { TextTransparency = 0 })
                 playId(SOUNDS.ambient, 0.5, false, 1.1)
             end
         end
 
         -- СТОКЕР
-        if stalkerPos and stalkerState ~= "none" and not waveActive then
-            if stalkerState == "follow" then
+        if ST.stalkerPos and ST.stalkerState ~= "none" and not ST.waveActive then
+            if ST.stalkerState == "follow" then
                 local target = myPos - flatLook * 22
-                local toT = target - stalkerPos
+                local toT = target - ST.stalkerPos
                 toT = Vector3.new(toT.X, 0, toT.Z)
                 local d = toT.Magnitude
                 if d > 0.5 then
-                    stalkerPos += toT.Unit * math.min(10.5 * dt, d)
-                    stalkerWalkPhase += dt * 6
+                    ST.stalkerPos += toT.Unit * math.min(10.5 * dt, d)
+                    ST.stalkerWalkPhase += dt * 6
                 end
                 if d > 70 then
-                    stalkerPos = myPos - flatLook * 26
+                    ST.stalkerPos = myPos - flatLook * 26
                 end
-                local toS = stalkerPos - myPos
+                local toS = ST.stalkerPos - myPos
                 local looking = toS.Magnitude > 0.5
                     and flatLook:Dot(Vector3.new(toS.X, 0, toS.Z).Unit) > 0.6
                     and toS.Magnitude < 60
                 if looking then
-                    stalkerLookTime += dt
-                    if stalkerLookTime > 1.2 then
-                        stalkerState = "charge"
-                        stalkerLookTime = 0
-                        camShake = 0.4
-                        setStatus("ОНО ПОБЕЖАЛО. БЕГИ.", true)
+                    ST.stalkerLookTime += dt
+                    if ST.stalkerLookTime > 1.2 then
+                        ST.stalkerState = "charge"
+                        ST.stalkerLookTime = 0
+                        ST.camShake = 0.4
+                        setStatusSafe("ОНО ПОБЕЖАЛО. БЕГИ.", true)
                     end
                 else
-                    stalkerLookTime = math.max(0, stalkerLookTime - dt)
+                    ST.stalkerLookTime = math.max(0, ST.stalkerLookTime - dt)
                 end
-                if t > stalkerTimer then
-                    stalkerState = "charge"
-                    camShake = 0.4
-                    setStatus("ОНО БЕЖИТ. БЕГИ.", true)
+                if t > ST.stalkerTimer then
+                    ST.stalkerState = "charge"
+                    ST.camShake = 0.4
+                    setStatusSafe("ОНО БЕЖИТ. БЕГИ.", true)
                 end
-            elseif stalkerState == "charge" then
-                local toMe = myPos - stalkerPos
+            elseif ST.stalkerState == "charge" then
+                local toMe = myPos - ST.stalkerPos
                 toMe = Vector3.new(toMe.X, 0, toMe.Z)
                 local d = toMe.Magnitude
                 if d > 0.5 then
-                    stalkerPos += toMe.Unit * math.min(26 * dt, d)
-                    stalkerWalkPhase += dt * 11
+                    ST.stalkerPos += toMe.Unit * math.min(26 * dt, d)
+                    ST.stalkerWalkPhase += dt * 11
                 end
-                camShake = math.max(camShake, 0.15)
+                ST.camShake = math.max(ST.camShake, 0.15)
                 if d < 4 then
                     applyDamage(15)
                     destroyStalker()
-                    setStatus("оно ударило и исчезло...", true)
+                    setStatusSafe("оно ударило и исчезло...", true)
                 end
             end
-            if heavy and stalker and stalker.Parent then
-                local moving = (stalkerState == "charge")
-                local gy = groundAt(stalkerPos, myPos.Y)
+            if heavy and ST.stalker and ST.stalker.Parent then
+                local moving = (ST.stalkerState == "charge")
+                local gy = groundAt(ST.stalkerPos, myPos.Y)
                 local base = CFrame.lookAt(
-                    Vector3.new(stalkerPos.X, gy, stalkerPos.Z),
+                    Vector3.new(ST.stalkerPos.X, gy, ST.stalkerPos.Z),
                     Vector3.new(myPos.X, gy, myPos.Z))
                 local speed = moving and 11 or 6
-                local swing = math.sin(stalkerWalkPhase) * (moving and 0.9 or 0.55)
-                for _, e in ipairs(stalkerParts) do
+                local swing = math.sin(ST.stalkerWalkPhase) * (moving and 0.9 or 0.55)
+                for _, e in ipairs(ST.stalkerParts) do
                     if e.half == 0 then
                         e.p.CFrame = base * e.pivot
                     else
@@ -2187,19 +2201,19 @@ RunService.Heartbeat:Connect(function(dt)
         end
 
         -- ПОЛЗУН
-        if crawlerState == "prowl" and crawler then
-            local toMe = myPos - crawlerPos
+        if ST.crawlerState == "prowl" and ST.crawler then
+            local toMe = myPos - ST.crawlerPos
             local flat = Vector3.new(toMe.X, 0, toMe.Z)
             local dist = flat.Magnitude
-            local dirToC = crawlerPos - myPos
+            local dirToC = ST.crawlerPos - myPos
             local seen = dist > 0.5
                 and flatLook:Dot(Vector3.new(dirToC.X, 0, dirToC.Z).Unit) > 0.5
                 and dist < 60
 
             local spd = seen and 2 or (dist > 25 and 9 or 4.5)
             if dist > 0.5 then
-                crawlerPos += flat.Unit * math.min(spd * dt, dist)
-                crawlerWalkPhase += dt * spd * 1.8
+                ST.crawlerPos += flat.Unit * math.min(spd * dt, dist)
+                ST.crawlerWalkPhase += dt * spd * 1.8
             end
 
             if dist < 3.5 then
@@ -2207,32 +2221,32 @@ RunService.Heartbeat:Connect(function(dt)
                 jumpscare(0.35)
                 destroyCrawler()
                 task.delay(math.random(15, 25), function()
-                    if not running then return end
+                    if not ST.running then return end
                     local rr = root()
                     if not rr then return end
                     local a = math.rad(math.random(0, 359))
                     local p = rr.Position + Vector3.new(math.cos(a) * 40, 0, math.sin(a) * 40)
                     p = Vector3.new(p.X, groundAt(p, rr.Position.Y), p.Z)
-                    crawler = buildCrawler(p)
-                    crawlerPos = p
-                    crawlerState = "prowl"
-                    crawlerWalkPhase = 0
-                    setStatus("шорох снова...", true)
+                    ST.crawler = buildCrawler(p)
+                    ST.crawlerPos = p
+                    ST.crawlerState = "prowl"
+                    ST.crawlerWalkPhase = 0
+                    setStatusSafe("шорох снова...", true)
                 end)
             else
                 if heavy then
-                    local gy = groundAt(crawlerPos, myPos.Y)
+                    local gy = groundAt(ST.crawlerPos, myPos.Y)
                     local base = CFrame.lookAt(
-                        Vector3.new(crawlerPos.X, gy + 0.6, crawlerPos.Z),
+                        Vector3.new(ST.crawlerPos.X, gy + 0.6, ST.crawlerPos.Z),
                         Vector3.new(myPos.X, gy + 0.6, myPos.Z))
                     local partsByName = {}
-                    for _, e in ipairs(crawlerParts) do
+                    for _, e in ipairs(ST.crawlerParts) do
                         partsByName[e.name] = e
                     end
-                    local crawlWave = math.sin(crawlerWalkPhase * 2) * 0.12
-                    local bob = math.abs(math.sin(crawlerWalkPhase)) * 0.2
-                    local roll = math.sin(crawlerWalkPhase) * 0.12
-                    for _, e in ipairs(crawlerParts) do
+                    local crawlWave = math.sin(ST.crawlerWalkPhase * 2) * 0.12
+                    local bob = math.abs(math.sin(ST.crawlerWalkPhase)) * 0.2
+                    local roll = math.sin(ST.crawlerWalkPhase) * 0.12
+                    for _, e in ipairs(ST.crawlerParts) do
                         if e.name == "torso" then
                             e.p.CFrame = base * e.off
                                 * CFrame.new(0, bob, 0)
@@ -2242,12 +2256,12 @@ RunService.Heartbeat:Connect(function(dt)
                             e.p.CFrame = base * e.off
                                 * CFrame.new(0, bob, 0)
                                 * CFrame.Angles(crawlWave, 0, roll)
-                                * CFrame.Angles(0, 0, math.sin(crawlerWalkPhase * 2 + ribN) * 0.15)
+                                * CFrame.Angles(0, 0, math.sin(ST.crawlerWalkPhase * 2 + ribN) * 0.15)
                         end
                     end
                     local twitchHead = (math.floor(t * 4) % 3 == 0)
                         and math.sin(t * 60) * 0.06 or 0
-                    local headNod = math.sin(crawlerWalkPhase * 2) * 0.12
+                    local headNod = math.sin(ST.crawlerWalkPhase * 2) * 0.12
                     if partsByName.head then
                         partsByName.head.p.CFrame = base * partsByName.head.off
                             * CFrame.new(0, bob, 0)
@@ -2265,7 +2279,7 @@ RunService.Heartbeat:Connect(function(dt)
                                 * CFrame.new(0, bob, 0) * CFrame.Angles(headNod, twitchHead, roll)
                         end
                     end
-                    local limbSwing = math.sin(crawlerWalkPhase) * 0.55
+                    local limbSwing = math.sin(ST.crawlerWalkPhase) * 0.55
                     if partsByName.armL then
                         partsByName.armL.p.CFrame = base * partsByName.armL.off
                             * CFrame.Angles(limbSwing, 0, 0)
@@ -2291,41 +2305,42 @@ RunService.Heartbeat:Connect(function(dt)
         end
 
         -- МАТЬ
-        if not waveActive and not mother and monsterPos and t - rageStart > 70 then
+        if not ST.waveActive and not ST.mother and ST.monsterPos and t - ST.rageStart > 70 then
             local a = math.rad(math.random(0, 359))
             local p = myPos + Vector3.new(math.cos(a) * 35, 0, math.sin(a) * 35)
             p = Vector3.new(p.X, groundAt(p, myPos.Y), p.Z)
-            mother = buildMother(p)
-            motherPos = p
-            motherNext = t + 1.5
-            motherTilt = 0
-            setStatus("ОНА ЗДЕСЬ. НЕ ОТВОДИ ВЗГЛЯД.", true)
+            ST.mother = buildMother(p)
+            ST.motherPos = p
+            ST.motherNext = t + 1.5
+            ST.motherTilt = 0
+            setStatusSafe("ОНА ЗДЕСЬ. НЕ ОТВОДИ ВЗГЛЯД.", true)
         end
-        if motherPos and mother and not waveActive then
-            local toMe = myPos - motherPos
+        if ST.motherPos and ST.mother and not ST.waveActive then
+            local toMe = myPos - ST.motherPos
             local flat = Vector3.new(toMe.X, 0, toMe.Z)
             local dist = flat.Magnitude
-            local dirToM = motherPos - myPos
+            local dirToM = ST.motherPos - myPos
             local seen = dist > 0.5
                 and flatLook:Dot(Vector3.new(dirToM.X, 0, dirToM.Z).Unit) > 0.25
                 and dist < 120
-            if not seen and t > motherNext then
-                motherNext = t + math.random(0.8, 2)
+            if not seen and t > ST.motherNext then
+                ST.motherNext = t + math.random(0.8, 2)
                 if dist > 5 then
                     local step = math.random(6, 10)
                     local jitter = Vector3.new(math.random(-4, 4), 0, math.random(-4, 4))
-                    motherPos = motherPos + flat.Unit * math.min(step, dist - 2) + jitter
-                    motherPos = Vector3.new(motherPos.X, groundAt(motherPos, myPos.Y), motherPos.Z)
-                    motherTilt = (motherTilt + math.random(20, 45)) % 180
+                    ST.motherPos = ST.motherPos + flat.Unit * math.min(step, dist - 2) + jitter
+                    ST.motherPos = Vector3.new(ST.motherPos.X,
+                        groundAt(ST.motherPos, myPos.Y), ST.motherPos.Z)
+                    ST.motherTilt = (ST.motherTilt + math.random(20, 45)) % 180
                     setStaticIntensity(0.85)
                     playId(SOUNDS.static, 0.5, false, math.random(70, 130) / 100)
-                    camShake = math.max(camShake, 0.25)
+                    ST.camShake = math.max(ST.camShake, 0.25)
                     task.delay(0.15, function() setStaticIntensity(0) end)
                 end
             end
             if dist < 10 and dist > 0.1 then
-                if not mother:GetAttribute("grind") or t - mother:GetAttribute("grind") > 1 then
-                    mother:SetAttribute("grind", t)
+                if not ST.mother:GetAttribute("grind") or t - ST.mother:GetAttribute("grind") > 1 then
+                    ST.mother:SetAttribute("grind", t)
                     playId(SOUNDS.static, 0.4, false, 0.5)
                 end
             end
@@ -2334,40 +2349,40 @@ RunService.Heartbeat:Connect(function(dt)
                 jumpscare(0.5, true)
                 destroyMother()
                 task.delay(math.random(25, 40), function()
-                    if not running then return end
+                    if not ST.running then return end
                     local rr = root()
                     if not rr then return end
                     local a = math.rad(math.random(0, 359))
                     local p = rr.Position + Vector3.new(math.cos(a) * 35, 0, math.sin(a) * 35)
                     p = Vector3.new(p.X, groundAt(p, rr.Position.Y), p.Z)
-                    mother = buildMother(p)
-                    motherPos = p
-                    motherTilt = 0
+                    ST.mother = buildMother(p)
+                    ST.motherPos = p
+                    ST.motherTilt = 0
                 end)
             end
-            if heavy and mother and mother.Parent then
-                local gy = groundAt(motherPos, myPos.Y)
+            if heavy and ST.mother and ST.mother.Parent then
+                local gy = groundAt(ST.motherPos, myPos.Y)
                 local base = CFrame.lookAt(
-                    Vector3.new(motherPos.X, gy, motherPos.Z),
+                    Vector3.new(ST.motherPos.X, gy, ST.motherPos.Z),
                     Vector3.new(myPos.X, gy, myPos.Z))
-                    * CFrame.Angles(0, 0, math.rad(motherTilt))
-                for _, e in ipairs(motherParts) do
+                    * CFrame.Angles(0, 0, math.rad(ST.motherTilt))
+                for _, e in ipairs(ST.motherParts) do
                     e.p.CFrame = base * e.off
                 end
             end
         end
 
         -- СИЛУЭТ
-        if watcherAlive and watcher then
-            local wPos = watcher:GetPivot().Position
+        if ST.watcherAlive and ST.watcher then
+            local wPos = ST.watcher:GetPivot().Position
             local flat = Vector3.new(myPos.X, wPos.Y, myPos.Z)
             local wDist = (myPos - wPos).Magnitude
             local lookW = CFrame.lookAt(Vector3.new(wPos.X, wPos.Y, wPos.Z), flat)
-            for _, e in ipairs(watcherParts) do
+            for _, e in ipairs(ST.watcherParts) do
                 e.p.CFrame = lookW * e.off
             end
             if wDist < 12 then
-                for _, e in ipairs(watcherParts) do
+                for _, e in ipairs(ST.watcherParts) do
                     local pe = Instance.new("ParticleEmitter")
                     pe.Rate = 120
                     pe.Lifetime = NumberRange.new(0.5, 1)
@@ -2377,54 +2392,52 @@ RunService.Heartbeat:Connect(function(dt)
                     pe.Transparency = NumberSequence.new(0.3)
                     pe.Parent = e.p
                 end
-                camShake = 0.2
-                local w = watcher
-                watcherAlive = false
-                watcher = nil
+                ST.camShake = 0.2
+                local w = ST.watcher
+                ST.watcherAlive = false
+                ST.watcher = nil
                 task.delay(1.4, function() w:Destroy() end)
                 task.delay(math.random(20, 40), function()
-                    if not running then return end
+                    if not ST.running then return end
                     local rr = root()
                     if not rr then return end
                     local a = math.rad(math.random(0, 359))
-                    watcher = buildWatcher(rr.Position + Vector3.new(math.cos(a) * 60, 0, math.sin(a) * 60))
-                    watcherAlive = true
+                    ST.watcher = buildWatcher(rr.Position + Vector3.new(math.cos(a) * 60, 0, math.sin(a) * 60))
+                    ST.watcherAlive = true
                 end)
             end
         end
 
-        if t > nextBehind and not waveActive then
-            nextBehind = t + math.random(40, 90)
+        if t > ST.nextBehind and not ST.waveActive then
+            ST.nextBehind = t + math.random(40, 90)
             flashBehindEvent()
             local p = myPos - flatLook * 7
             p = Vector3.new(p.X, groundAt(p, myPos.Y), p.Z)
             local gw = buildWatcher(p)
             task.delay(2.5, function() if gw then gw:Destroy() end end)
         end
-        if t > nextFlicker then
-            nextFlicker = t + math.random(25, 60)
+        if t > ST.nextFlicker then
+            ST.nextFlicker = t + math.random(25, 60)
             task.spawn(function()
                 for _ = 1, 6 do
                     Lighting.Brightness = math.random(1, 10) / 10
-                    if flashOn then spot.Enabled = math.random() > 0.5 end
+                    if ST.flashOn then spot.Enabled = math.random() > 0.5 end
                     task.wait(0.07)
                 end
                 Lighting.Brightness = 0.8
-                if flashOn then spot.Enabled = true end
+                if ST.flashOn then spot.Enabled = true end
             end)
             playId(SOUNDS.voices, 0.2, false, 1.15)
         end
     end)
 
-    if not ok and not warnedOnce then
-        warnedOnce = true
+    if not ok and not ST.warnedOnce then
+        ST.warnedOnce = true
         warn("[Nightfall] ошибка цикла:", err)
     end
 end)
 
----------------------------------------------------------------- СТРЕЛЬБА / ЛОМ
-local crowbarSwingT = 0
-
+---------------------------------------------------------------- СТРЕЛЬБА
 local function pickShotTarget(origin, dir)
     local best, bestDist = nil, math.huge
     local function test(pos, radius, height, kind)
@@ -2436,19 +2449,19 @@ local function pickShotTarget(origin, dir)
             end
         end
     end
-    if monsterPos then
-        test(monsterPos, 4, 15, "monster")
+    if ST.monsterPos then
+        test(ST.monsterPos, 4, 15, "monster")
     end
-    if brutePos then
-        test(brutePos, 4.5, 14, "brute")
+    if ST.brutePos then
+        test(ST.brutePos, 4.5, 14, "brute")
     end
-    if stalkerPos and stalkerState ~= "none" then
-        test(stalkerPos, 2.5, 7, "stalker")
+    if ST.stalkerPos and ST.stalkerState ~= "none" then
+        test(ST.stalkerPos, 2.5, 7, "stalker")
     end
-    if crawlerState == "prowl" and crawlerPos then
-        test(crawlerPos, 2.5, 3, "crawler")
+    if ST.crawlerState == "prowl" and ST.crawlerPos then
+        test(ST.crawlerPos, 2.5, 3, "crawler")
     end
-    for i, wc in ipairs(waveCreatures) do
+    for i, wc in ipairs(ST.waveCreatures) do
         if wc.model and wc.model.Parent then
             test(wc.pos, 2, 7, "wave_" .. i)
         end
@@ -2462,32 +2475,32 @@ UserInputService.InputBegan:Connect(function(input, gp)
         local char = LocalPlayer.Character
         if char and char:FindFirstChild("Лом") then
             local now = os.clock()
-            if now - crowbarSwingT > 0.9 then
-                crowbarSwingT = now
+            if now - T.crowbarSwingT > 0.9 then
+                T.crowbarSwingT = now
                 playId(SOUNDS.crowbarHit, 0.9, false, math.random(90, 110) / 100)
                 local r = root()
                 if r then
                     local killed = false
-                    if stalkerPos and stalkerState ~= "none" then
-                        local d = (r.Position - stalkerPos).Magnitude
+                    if ST.stalkerPos and ST.stalkerState ~= "none" then
+                        local d = (r.Position - ST.stalkerPos).Magnitude
                         if d < 6 then
                             playId(SOUNDS.crowbarHit, 1, false, 0.8)
                             destroyStalker()
                             killed = true
-                            setStatus("ЛОМ: стокер уничтожен", false)
+                            setStatusSafe("ЛОМ: стокер уничтожен", false)
                         end
                     end
-                    if not killed and crawlerState == "prowl" and crawlerPos then
-                        local d = (r.Position - crawlerPos).Magnitude
+                    if not killed and ST.crawlerState == "prowl" and ST.crawlerPos then
+                        local d = (r.Position - ST.crawlerPos).Magnitude
                         if d < 6 then
                             playId(SOUNDS.crowbarHit, 1, false, 0.8)
                             destroyCrawler()
                             killed = true
-                            setStatus("ЛОМ: ползун уничтожен", false)
+                            setStatusSafe("ЛОМ: ползун уничтожен", false)
                         end
                     end
                     if not killed then
-                        setStatus("мимо · лом не берёт босса/Громилу/Мать", true)
+                        setStatusSafe("мимо · лом не берёт босса/Громилу/Мать", true)
                     end
                 end
             end
@@ -2508,7 +2521,7 @@ UserInputService.InputBegan:Connect(function(input, gp)
                     light.Parent = flash
                     task.delay(0.09, function() flash:Destroy() end)
                 end
-                camShake = math.max(camShake, 0.35)
+                ST.camShake = math.max(ST.camShake, 0.35)
                 local r = root()
                 if r then
                     r.AssemblyLinearVelocity -= camera.CFrame.LookVector * 14
@@ -2522,13 +2535,14 @@ UserInputService.InputBegan:Connect(function(input, gp)
                 local target = pickShotTarget(origin, dir)
 
                 if target == "monster" then
-                    monsterHP -= 1
-                    monsterHits += 1
-                    monsterStagger = os.clock() + 2
-                    monsterRage = math.min(4, monsterRage + 1)
-                    rageStart = math.min(rageStart, os.clock() - (rageTimes[monsterRage] or 0) - 1)
+                    ST.monsterHP -= 1
+                    ST.monsterHits += 1
+                    ST.monsterStagger = os.clock() + 2
+                    ST.monsterRage = math.min(4, ST.monsterRage + 1)
+                    ST.rageStart = math.min(ST.rageStart,
+                        os.clock() - (CFG.rageTimes[ST.monsterRage] or 0) - 1)
                     playId(SOUNDS.roar, 1, false, math.random(85, 105) / 100)
-                    camShake = 0.6
+                    ST.camShake = 0.6
                     if monsterEyes then
                         for _, eye in ipairs(monsterEyes) do
                             eye.Color = Color3.fromRGB(255, 255, 255)
@@ -2543,97 +2557,97 @@ UserInputService.InputBegan:Connect(function(input, gp)
                             end
                         end
                     end)
-                    if monsterHP <= 0 then
+                    if ST.monsterHP <= 0 then
                         print("[Nightfall] БОСС УБИТ")
                         destroyMonster()
-                        monsterPos = nil
+                        ST.monsterPos = nil
                         jumpscare(0.6, true)
-                        winBack.Visible = true
-                        winBack.BackgroundTransparency = 1
-                        tween(winBack, 0.4, { BackgroundTransparency = 0.08 })
-                        winSub.Text = "но снаружи что-то проснулось..."
+                        UI.winBack.Visible = true
+                        UI.winBack.BackgroundTransparency = 1
+                        tween(UI.winBack, 0.4, { BackgroundTransparency = 0.08 })
+                        UI.winSub.Text = "но снаружи что-то проснулось..."
                         task.delay(6, function()
-                            tween(winBack, 0.5, { BackgroundTransparency = 1 })
+                            tween(UI.winBack, 0.5, { BackgroundTransparency = 1 })
                             task.delay(0.5, function()
-                                winBack.Visible = false
-                                waveStartDelay = os.clock() + 4
+                                UI.winBack.Visible = false
+                                ST.waveStartDelay = os.clock() + 4
                             end)
                         end)
                     else
-                        setStatus("ПОПАДАНИЕ · " .. (6 - monsterHP) .. "/6", true)
+                        setStatusSafe("ПОПАДАНИЕ · " .. (6 - ST.monsterHP) .. "/6", true)
                     end
                 elseif target == "brute" then
-                    bruteHP -= 1
+                    ST.bruteHP -= 1
                     playId(SOUNDS.roar, 0.9, false, 0.7)
-                    camShake = 0.5
-                    if bruteHP <= 0 then
+                    ST.camShake = 0.5
+                    if ST.bruteHP <= 0 then
                         destroyBrute()
-                        setStatus("ГРОМИЛА ПОВЕРЖЕН", false)
+                        setStatusSafe("ГРОМИЛА ПОВЕРЖЕН", false)
                     else
-                        setStatus("ГРОМИЛА · осталось: " .. bruteHP, true)
+                        setStatusSafe("ГРОМИЛА · осталось: " .. ST.bruteHP, true)
                     end
                 elseif target == "stalker" then
                     playId(SOUNDS.scream, 0.9, false, 1.2)
                     destroyStalker()
-                    setStatus("ВЫСТРЕЛ: стокер уничтожен", false)
+                    setStatusSafe("ВЫСТРЕЛ: стокер уничтожен", false)
                 elseif target == "crawler" then
                     playId(SOUNDS.scream, 0.9, false, 1.35)
                     destroyCrawler()
-                    setStatus("ВЫСТРЕЛ: ползун уничтожен", false)
+                    setStatusSafe("ВЫСТРЕЛ: ползун уничтожен", false)
                 elseif target and target:sub(1, 5) == "wave_" then
                     local idx = tonumber(target:sub(6))
-                    local wc = waveCreatures[idx]
+                    local wc = ST.waveCreatures[idx]
                     if wc and wc.model and wc.model.Parent then
                         playId(SOUNDS.scream, 0.8, false, 1.25)
                         wc.model:Destroy()
-                        waveKills += 1
-                        table.remove(waveCreatures, idx)
-                        setStatus("ВЫСТРЕЛ: тварь волны уничтожена", false)
+                        ST.waveKills += 1
+                        table.remove(ST.waveCreatures, idx)
+                        setStatusSafe("ВЫСТРЕЛ: тварь волны уничтожена", false)
                     else
-                        setStatus("ПРОМАХ", true)
+                        setStatusSafe("ПРОМАХ", true)
                     end
                 else
-                    setStatus("ПРОМАХ", true)
+                    setStatusSafe("ПРОМАХ", true)
                 end
             else
-                setStatus("ПУСТО · V = перезарядка", true)
+                setStatusSafe("ПУСТО · V = перезарядка", true)
             end
         end
     end
     if input.KeyCode == Enum.KeyCode.F then
-        setFlash(not flashOn)
+        setFlash(not ST.flashOn)
     elseif input.KeyCode == Enum.KeyCode.V then
         toggleReloadUI()
     elseif input.KeyCode == Enum.KeyCode.RightShift then
-        local isOpen = panel.Visible
+        local isOpen = UI.panel.Visible
         if isOpen then
-            tween(panel, 0.2, { GroupTransparency = 1 })
-            tween(panelScale, 0.2, { Scale = 0.94 })
-            task.delay(0.2, function() panel.Visible = false end)
+            tween(UI.panel, 0.2, { GroupTransparency = 1 })
+            tween(UI.panelScale, 0.2, { Scale = 0.94 })
+            task.delay(0.2, function() UI.panel.Visible = false end)
             openBtn.Visible = true
         else
-            panel.Visible = true
-            panel.GroupTransparency = 1
-            panelScale.Scale = 0.94
-            tween(panel, 0.25, { GroupTransparency = 0 })
-            tween(panelScale, 0.3, { Scale = 1 }, Enum.EasingStyle.Back)
+            UI.panel.Visible = true
+            UI.panel.GroupTransparency = 1
+            UI.panelScale.Scale = 0.94
+            tween(UI.panel, 0.25, { GroupTransparency = 0 })
+            tween(UI.panelScale, 0.3, { Scale = 1 }, Enum.EasingStyle.Back)
             openBtn.Visible = false
         end
     end
 end)
 
 openBtn.Activated:Connect(function()
-    panel.Visible = true
-    panel.GroupTransparency = 1
-    panelScale.Scale = 0.94
-    tween(panel, 0.25, { GroupTransparency = 0 })
-    tween(panelScale, 0.3, { Scale = 1 }, Enum.EasingStyle.Back)
+    UI.panel.Visible = true
+    UI.panel.GroupTransparency = 1
+    UI.panelScale.Scale = 0.94
+    tween(UI.panel, 0.25, { GroupTransparency = 0 })
+    tween(UI.panelScale, 0.3, { Scale = 1 }, Enum.EasingStyle.Back)
     openBtn.Visible = false
 end)
-closeBtn.Activated:Connect(function()
-    tween(panel, 0.2, { GroupTransparency = 1 })
-    tween(panelScale, 0.2, { Scale = 0.94 })
-    task.delay(0.2, function() panel.Visible = false end)
+UI.closeBtn.Activated:Connect(function()
+    tween(UI.panel, 0.2, { GroupTransparency = 1 })
+    tween(UI.panelScale, 0.2, { Scale = 0.94 })
+    task.delay(0.2, function() UI.panel.Visible = false end)
     openBtn.Visible = true
 end)
 
@@ -2642,32 +2656,32 @@ menuButton("▶ ЗАПУСТИТЬ ИСПЫТАНИЕ", "босс 6 пуль · 
     local ok, err = pcall(startRitual)
     if not ok then
         warn("[Nightfall] ошибка запуска:", err)
-        setStatus("ошибка · консоль (F9)", true)
+        setStatusSafe("ошибка · консоль (F9)", true)
         return
     end
-    panel.Visible = false
+    UI.panel.Visible = false
     openBtn.Visible = true
 end)
 
 menuButton("ФОНАРИК · F", "вкл/выкл", false, function()
-    setFlash(not flashOn)
-    setStatus(flashOn and "фонарик вкл" or "фонарик выкл", false)
+    setFlash(not ST.flashOn)
+    setStatusSafe(ST.flashOn and "фонарик вкл" or "фонарик выкл", false)
 end)
 
 menuButton("TRACKER / ИНВЕНТАРЬ", "V = перезарядка (с дробовиком)", false, function()
-    radarOpen = not radarOpen
-    radarFrame.Visible = radarOpen
+    ST.radarOpen = not ST.radarOpen
+    UI.radarFrame.Visible = ST.radarOpen
     refreshInvUI()
 end)
 
 New("TextLabel", {
-    Text = "ХИТБОКС честные — целишься в тело = попадаешь.\n12 ящиков: 6×2 патрона, 3 лома, 3 адреналина.\nСтокер/ползун/волна убиваются выстрелом.\nБосс 6 пуль → волна → перебей = ПОБЕДА.",
+    Text = "ХИТБОКС честные · 12 ящиков по 2 патрона.\nСтокер/ползун/волна убиваются выстрелом.\nБосс 6 пуль → волна → перебей = ПОБЕДА.",
     Font = F.mono, TextSize = 10, TextColor3 = C.dim,
-    BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 90),
+    BackgroundTransparency = 1, Size = UDim2.new(1, 0, 0, 76),
     LayoutOrder = ord(), TextXAlignment = Enum.TextXAlignment.Left,
-    TextYAlignment = Enum.TextYAlignment.Top, Parent = body,
+    TextYAlignment = Enum.TextYAlignment.Top, Parent = UI.body,
 })
 
 ---------------------------------------------------------------- старт
 refreshInvUI()
-print("[Nightfall] v17 запущен из: " .. script:GetFullName())
+print("[Nightfall] v19 запущен из: " .. script:GetFullName())
